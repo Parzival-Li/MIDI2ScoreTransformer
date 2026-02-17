@@ -3,7 +3,7 @@ This module contains code for chunking MIDI and MusicXML files into pseudo-measu
 beat-level annotations from the ASAP dataset to align the MIDI and MusicXML.
 
 We use a greedy algorithm to align the MIDI and MusicXML files by moving notes that are
-close to the beat boundaries to the next/previous measure if that improves the alignment.
+close to the beat bou  ndaries to the next/previous measure if that improves the alignment.
 The resulting chunks are saved as JSON files next to the performance-MIDI files.
 """
 
@@ -120,7 +120,7 @@ def make_measures(midi, midi_score, mxl, annots, swap=True):
 
 
 def handle_file(midi_path, mxl_path, save_path):
-    annots = annotations[midi_path.replace("./data/asap-dataset/", "")]
+    annots = annotations[midi_path.replace("/mnt/ssd/hbli/datasets/PM2S_dataset/midi2scoretransformer/asap-dataset/", "")]
     if not annots["score_and_performance_aligned"]:
         return
     import warnings
@@ -153,10 +153,10 @@ def handle_file(midi_path, mxl_path, save_path):
 
 
 if __name__ == "__main__":
-    annotations = json.load(open("data/asap-dataset/asap_annotations.json"))
-    skip = set(["data/asap-dataset/Glinka/The_Lark"])
+    annotations = json.load(open("/mnt/ssd/hbli/datasets/PM2S_dataset/midi2scoretransformer/asap-dataset/asap_annotations.json"))
+    skip = set(["/mnt/ssd/hbli/datasets/PM2S_dataset/midi2scoretransformer/asap-dataset/Glinka/The_Lark"])
     paths = []
-    for root, dirs, files in os.walk("data/asap-dataset/"):
+    for root, dirs, files in os.walk("/mnt/ssd/hbli/datasets/PM2S_dataset/midi2scoretransformer/asap-dataset/"):
         for file in files:
             if file.endswith(".musicxml") and root not in skip:
                 mxl_path = os.path.join(root, file)
@@ -169,7 +169,7 @@ if __name__ == "__main__":
                 save_path = os.path.join(root, file.replace(".mid", "_chunks.json"))
                 paths.append((midi_path, mxl_path, save_path))
 
-    q = ASAPDataset("./data/", "all")
+    q = ASAPDataset("/mnt/ssd/hbli/datasets/PM2S_dataset/midi2scoretransformer/", "all")
     midi_paths = [
         q.metadata.iloc[idx]["performance_MIDI_external"].replace(
             "{ASAP}", f"{q.data_dir}asap-dataset"

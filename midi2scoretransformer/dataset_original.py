@@ -164,9 +164,7 @@ class ASAPDataset(Dataset):
         input_stream, output_stream = torch.load(pkl_file, weights_only=False)
 
         if self.augmentations.get("transpose", False):
-            # shift = random.randint(-6, 6)
-            max_semitones = int(self.augmentations["transpose"])
-            shift = random.randint(-max_semitones, max_semitones)
+            shift = random.randint(-6, 6)
             input_stream["pitch"], output_stream["pitch"], output_stream["accidental"], output_stream["keysignature"] = self._transpose(
                 shift,
                 midi_stream=input_stream["pitch"],
@@ -175,14 +173,11 @@ class ASAPDataset(Dataset):
                 keysignature_stream=output_stream["keysignature"]
             )
 
-        # tempo augmentation: alpha
         if (v := self.augmentations.get("tempo_jitter", False)):
-            alpha = random.uniform(*v)
-            input_stream["onset"] = input_stream["onset"] * alpha
-        # duration jitter: beta
-        if (v := self.augmentations.get("duration_jitter", False)):
-            beta = random.uniform(*v)
-            input_stream["duration"] = input_stream["duration"] * beta
+            jitter_onset = random.uniform(*v)
+            jitter_duration = jitter_onset + random.uniform(-0.05, 0.05)
+            input_stream["onset"] = input_stream["onset"] * jitter_onset
+            input_stream["duration"] = input_stream["duration"] * jitter_duration
         if (v := self.augmentations.get("onset_jitter", False)):
             jitter = 1 + torch.randn(input_stream["onset"].shape) * v
             # adjust intervals between onsets
@@ -338,7 +333,6 @@ class ASAPDataset(Dataset):
         midi_stream = shift_pitch(midi_stream, shift)
         results = [midi_stream]
         if mxl_stream is not None and accidental_stream is not None and keysignature_stream is not None:
-            shift_pc = ((shift + 6) % 12) - 6
             if shift == 0 and random.random() < 0.5:
                 # Always include the original version some of the time.
                 pass
@@ -358,7 +352,7 @@ class ASAPDataset(Dataset):
                     5: ["P4", "A3"],
                     6: ["d5", "A4"],
                 }
-                intervals = INTERVALS[shift_pc]
+                intervals = INTERVALS[shift]
                 m = mxl_stream.numpy()
                 a = accidental_stream.numpy()
                 ks = keysignature_stream.unique()
