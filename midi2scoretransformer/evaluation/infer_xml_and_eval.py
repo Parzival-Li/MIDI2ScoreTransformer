@@ -18,10 +18,9 @@ import pandas as pd
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-# Make repo imports work (same as your original script)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dataset import ASAPDataset
+from dataset_original import ASAPDataset
 from models.roformer import Roformer
 from tokenizer import MultistreamTokenizer
 from utils import infer, pad_batch, score_similarity_normalized
@@ -48,12 +47,14 @@ def asap_relpath(sample_midi_path: str) -> str:
     return os.path.basename(sample_midi_path)
 
 
-def build_pred_xml_path(out_dir: str, sample_midi_path: str, filename: str = "pred_score.musicxml") -> str:
-    rel = asap_relpath(sample_midi_path)
-    rel_dir = os.path.dirname(rel)
+def build_pred_xml_path(out_dir: str, sample_midi_path: str) -> str:
+    rel = asap_relpath(sample_midi_path)                    # e.g. Chopin/Nocturne/midi1.mid
+    rel_dir = os.path.dirname(rel)                          # Chopin/Nocturne
+    base = os.path.splitext(os.path.basename(rel))[0]       # midi1
     pred_dir = os.path.join(out_dir, rel_dir)
     ensure_dir(pred_dir)
-    return os.path.join(pred_dir, filename)
+    name = f"pred_{base}.musicxml"
+    return os.path.join(pred_dir, name)
 
 
 def parse_song_fields_from_rel(rel: str) -> Dict[str, Any]:
@@ -195,7 +196,10 @@ def main():
     lengths, inputs, paths = zip(*sorted_data)
 
     print("Loading model")
-    model = Roformer.load_from_checkpoint(args.model)
+    model = Roformer.load_from_checkpoint(
+        args.model,
+        map_location="cuda:0"
+    )
     model.to(device)
     model.eval()
 
@@ -223,7 +227,7 @@ def main():
         # slice tokens back to true length for this song
         y_hat_i = {k: v[i, :length_i] for k, v in y_full.items()}
 
-        pred_path = build_pred_xml_path(args.out_dir, midi_path, filename="pred_score.musicxml")
+        pred_path = build_pred_xml_path(args.out_dir, midi_path)
         sim, pred_written = eval_from_tokens_and_write_xml(y_hat_i, gt_path, pred_path)
         flat = flatten_metrics(sim)
 

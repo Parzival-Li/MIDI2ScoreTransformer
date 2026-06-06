@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dataset import ASAPDataset
+from midi2scoretransformer.dataset_v2 import ASAPDataset
 from models.roformer import Roformer
 from tokenizer import MultistreamTokenizer
 from utils import eval, infer, pad_batch

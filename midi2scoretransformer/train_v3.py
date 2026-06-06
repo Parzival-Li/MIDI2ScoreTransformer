@@ -3,6 +3,7 @@
 
 import os
 import argparse
+import random
 from typing import Dict, Any
 
 import torch
@@ -14,7 +15,9 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger
 
-from midi2scoretransformer.dataset_v2 import ASAPDataset
+from dataset_v3 import ASAPDataset
+from dataset_v3 import UnpairedXMLDataset
+
 from config import MyModelConfig, FEATURES
 from models.roformer import Roformer
 
@@ -23,6 +26,13 @@ try:
 except Exception:
     get_cosine_schedule_with_warmup = None
 
+import warnings
+# filter music21 warnings for unpaired xml
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"music21\..*",
+)
 
 def _apply_history_dropout(
     y: Dict[str, torch.Tensor],
@@ -69,6 +79,39 @@ def _apply_history_dropout(
     out[pad_key] = y[pad_key]
     return out
 
+class MixedBatchIterator:  # [ADDED]
+    """
+    Minimal mixed loader:
+    yield (x, y) batches from paired_loader / unpaired_loader with probability.
+    Keep output format identical to your original code: batch == (x, y).
+    """
+    def __init__(self, paired_loader: DataLoader, unpaired_loader: DataLoader, unpaired_ratio: float, seed: int = 42):
+        self.paired_loader = paired_loader
+        self.unpaired_loader = unpaired_loader
+        self.unpaired_ratio = float(unpaired_ratio)
+        self.rng = random.Random(seed)
+
+    def __iter__(self):
+        paired_it = iter(self.paired_loader)
+        unpaired_it = iter(self.unpaired_loader)
+
+        while True:
+            use_unpaired = (self.rng.random() < self.unpaired_ratio)
+            if use_unpaired:
+                try:
+                    batch = next(unpaired_it)
+                except StopIteration:
+                    unpaired_it = iter(self.unpaired_loader)
+                    batch = next(unpaired_it)
+            else:
+                try:
+                    batch = next(paired_it)
+                except StopIteration:
+                    paired_it = iter(self.paired_loader)
+                    batch = next(paired_it)
+
+            # IMPORTANT: keep exactly (x, y) format
+            yield batch[0], batch[1]
 
 class TrainRoformer(Roformer):
     """
@@ -83,7 +126,8 @@ class TrainRoformer(Roformer):
         lr: float = 3e-4,
         weight_decay: float = 0.01,
         pad_loss_weight: float = 0.1,
-        teacher_keep_prob: float = 0.25,
+        teacher_keep_prob_paired: float = 0.25, 
+        teacher_keep_prob_unpaired: float = 0.50,
         warmup_steps: int = 4000,
         max_steps: int = 40000,
     ):
@@ -91,7 +135,8 @@ class TrainRoformer(Roformer):
         self.lr = lr
         self.weight_decay = weight_decay
         self.pad_loss_weight = pad_loss_weight
-        self.teacher_keep_prob = teacher_keep_prob
+        self.teacher_keep_prob_paired = teacher_keep_prob_paired
+        self.teacher_keep_prob_unpaired = teacher_keep_prob_unpaired
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
 
@@ -130,9 +175,22 @@ class TrainRoformer(Roformer):
         # pad mask for loss
         pad_mask = (y["pad"] > 0)
 
-        # teacher-forcing history dropout (approx paper trick)
-        y_in = _apply_history_dropout(y, keep_prob=self.teacher_keep_prob)
+        # Determine if this batch is unpaired via x["unconditional"] (B,T,1)
+        # unconditional==1 -> unpaired, unconditional==0 -> paired
+        if "unconditional" in x:
+            # x["unconditional"] could be (B,T,1) float
+            is_unpaired = (x["unconditional"][:, 0, 0] > 0.5)  # (B,) bool
+            # assume batch is homogeneous; MixedBatchIterator yields whole batches from one loader
+            use_unpaired = bool(is_unpaired.all().item())
+        else:
+            use_unpaired = False
 
+        keep_prob = self.teacher_keep_prob_unpaired if use_unpaired else self.teacher_keep_prob_paired
+        
+        y_in = _apply_history_dropout(y, keep_prob=keep_prob)
+        self.log("train/is_unpaired", float(use_unpaired), prog_bar=False, on_step=True, on_epoch=True)
+        self.log("train/teacher_keep_prob", float(keep_prob), prog_bar=False, on_step=True, on_epoch=True)
+        
         y_hat = self.forward(x, y_in)  # dict: streams + "pad" logits
 
         total = 0.0
@@ -247,7 +305,8 @@ def build_model(args) -> TrainRoformer:
         lr=args.lr,
         weight_decay=args.weight_decay,
         pad_loss_weight=args.pad_loss_weight,
-        teacher_keep_prob=args.teacher_keep_prob,
+        teacher_keep_prob_paired=args.teacher_keep_prob_paired,
+        teacher_keep_prob_unpaired=args.teacher_keep_prob_unpaired,
         warmup_steps=args.warmup_steps,
         max_steps=args.max_steps,
     )
@@ -263,6 +322,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--seq_length", type=int, default=512)
+    parser.add_argument("--unpaired_list", type=str, default="", help="txt file, each line is an unpaired MusicXML path")  # [ADDED]
+    parser.add_argument("--unpaired_ratio", type=float, default=0.5, help="probability of sampling an unpaired batch per step")  # [ADDED]
 
     # training schedule
     parser.add_argument("--max_steps", type=int, default=40000)
@@ -281,8 +342,9 @@ def main():
 
     # loss tricks
     parser.add_argument("--pad_loss_weight", type=float, default=0.1)
-    parser.add_argument("--teacher_keep_prob", type=float, default=0.25)
-
+    parser.add_argument("--teacher_keep_prob_paired", type=float, default=0.25)
+    parser.add_argument("--teacher_keep_prob_unpaired", type=float, default=0.50)
+    
     # runtime/debug
     parser.add_argument("--gpu_id", type=int, default=0, help="physical GPU id (use CUDA_VISIBLE_DEVICES or set this)")
     parser.add_argument("--precision", type=str, default="16-mixed")
@@ -307,7 +369,7 @@ def main():
             "transpose": 12,
             "tempo_jitter": (0.8, 1.2),
             "duration_jitter": (0.95, 1.05),
-            "onset_jitter": 0.05
+            "onset_jitter": 0.1
         },
         return_continous=False,
     )
@@ -321,15 +383,44 @@ def main():
         return_continous=False,
     )
 
-    train_loader = DataLoader(
+    paired_loader = DataLoader(
+        # [CHANGED] train_loader -> paired_loader
         train_set,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
-        shuffle=False,  # train split 已经在 __getitem__ 里按 lengths multinomial 采样
+        shuffle=False,
         drop_last=True,
         persistent_workers=(args.num_workers > 0),
     )
+
+    # ---- Unpaired loader (optional) [ADDED]----
+    if args.unpaired_list and os.path.exists(args.unpaired_list):
+        unpaired_set = UnpairedXMLDataset(
+            mxl_paths=args.unpaired_list,
+            seq_length=args.seq_length,
+            cache=True,
+            augmentations={"transpose": 12},
+            skip_on_error=True
+        )
+        unpaired_loader = DataLoader(
+            unpaired_set,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            shuffle=True,
+            drop_last=True,
+            persistent_workers=(args.num_workers > 0)
+        )
+        train_loader = MixedBatchIterator(
+            paired_loader=paired_loader,
+            unpaired_loader=unpaired_loader,
+            unpaired_ratio=args.unpaired_ratio,
+            seed=args.seed,
+        )
+    else:
+        train_loader = paired_loader
+
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
@@ -350,7 +441,7 @@ def main():
         monitor="val/loss_total",
         mode="min",
         save_last=True,
-        every_n_train_steps=1000,
+        auto_insert_metric_name=False,
     )
     lr_cb = LearningRateMonitor(logging_interval="step")
 
@@ -369,12 +460,12 @@ def main():
         fast_dev_run=args.fast_dev_run,
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
-        check_val_every_n_epoch=1,
+        val_check_interval=1000,
+        check_val_every_n_epoch=None,
         enable_checkpointing=True,
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-
 
 if __name__ == "__main__":
     main()

@@ -16,7 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pretty_midi
 from joblib import Parallel, delayed
 
-from dataset import ASAPDataset
+from midi2scoretransformer.dataset_v2 import ASAPDataset
 from tokenizer import MultistreamTokenizer
 
 
