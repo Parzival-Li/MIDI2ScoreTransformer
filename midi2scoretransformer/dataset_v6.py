@@ -27,6 +27,31 @@ from tokenizer_v2 import MultistreamTokenizer
 import signal
 from contextlib import contextmanager
 
+
+def _pianocore_path_variants(path_like: str) -> list[str]:
+    s = str(path_like).replace("\\", "/").strip().lstrip("./")
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return []
+
+    variants: list[str] = []
+
+    def add(x: str):
+        x = x.replace("\\", "/").strip().lstrip("./")
+        if x and x not in variants:
+            variants.append(x)
+
+    add(s)
+    base = s
+    for prefix in ("PianoCoRe/raw/", "PianoCoRe/", "raw/"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    add(base)
+    add(f"raw/{base}")
+    add(f"PianoCoRe/{base}")
+    add(f"PianoCoRe/raw/{base}")
+    return variants
+
 class ASAPDataset(Dataset):
     """Implements a torch-compatible interface to the ASAP Dataset"""
     def __init__(
@@ -443,6 +468,8 @@ class PianoCoReDataset(Dataset):
         return_paths: bool = False,
         id: str = "pianocore_paired_v1_2026_05_18",
         split_col: str = "",
+        require_chunk_file: bool = True,
+        max_rows: int = 0,
         skip_on_error: bool = True,
         max_retries: int = 50,
         fail_log_path: str = "",
@@ -460,6 +487,8 @@ class PianoCoReDataset(Dataset):
         self.return_continous = bool(return_continous)
         self.return_paths = bool(return_paths)
         self.id = id
+        self.require_chunk_file = bool(require_chunk_file)
+        self.max_rows = int(max_rows)
         self.skip_on_error = bool(skip_on_error)
         self.max_retries = int(max_retries)
         self.fail_log_flush = bool(fail_log_flush)
@@ -501,6 +530,13 @@ class PianoCoReDataset(Dataset):
                 df = df[df["split"].astype(str).eq(split)]
             # If no split column exists, keep all rows. The manifest can already be train-only.
 
+        df = df[df["performance_midi_path"].notna() & df["score_xml_path"].notna() & df["chunk_path"].notna()]
+        if self.require_chunk_file:
+            exists = df["chunk_path"].map(lambda p: os.path.exists(self._resolve_path(p)))
+            df = df[exists]
+        if self.max_rows and self.max_rows > 0:
+            df = df.head(self.max_rows).copy()
+
         df = df.reset_index(drop=True)
         return df
 
@@ -511,7 +547,20 @@ class PianoCoReDataset(Dataset):
         p = Path(str(path_like))
         if p.is_absolute():
             return str(p)
-        return str(Path(self.pianocore_root) / p)
+        root = Path(self.pianocore_root)
+        for variant in _pianocore_path_variants(str(path_like)):
+            candidate = root / variant
+            if candidate.exists():
+                return str(candidate)
+        variants = _pianocore_path_variants(str(path_like))
+        if variants:
+            base = variants[0]
+            for prefix in ("PianoCoRe/raw/", "PianoCoRe/", "raw/"):
+                if base.startswith(prefix):
+                    base = base[len(prefix):]
+                    break
+            return str(root / "PianoCoRe" / "raw" / base)
+        return str(root / p)
 
     def _cache_path(self, performance_midi_path: str, score_xml_path: str) -> str:
         key = performance_midi_path + "||" + score_xml_path + "||" + self.id

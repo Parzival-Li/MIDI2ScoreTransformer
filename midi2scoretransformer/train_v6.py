@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import os
 import argparse
 import random
@@ -15,8 +17,9 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger
 
-from dataset_v5 import ASAPDataset
-from dataset_v5 import UnpairedXMLDataset
+from dataset_v6 import ASAPDataset
+from dataset_v6 import PianoCoReDataset
+from dataset_v6 import UnpairedXMLDataset
 
 from config import MyModelConfig, FEATURES
 from models.roformer import Roformer
@@ -111,6 +114,52 @@ class MixedBatchIterator:  # [ADDED]
                     batch = next(paired_it)
 
             # IMPORTANT: keep exactly (x, y) format
+            yield batch[0], batch[1]
+
+
+class MultiSourceBatchIterator:
+    """
+    Yield homogeneous batches from ASAP paired, PianoCoRe paired, and optional unpaired XML loaders.
+
+    Sampling order:
+      1) unpaired batch with probability unpaired_ratio;
+      2) otherwise PianoCoRe paired batch with probability pianocore_ratio;
+      3) otherwise ASAP paired batch.
+    """
+
+    def __init__(
+        self,
+        asap_loader: DataLoader,
+        pianocore_loader: DataLoader | None = None,
+        pianocore_ratio: float = 0.0,
+        unpaired_loader: DataLoader | None = None,
+        unpaired_ratio: float = 0.0,
+        seed: int = 42,
+    ):
+        self.asap_loader = asap_loader
+        self.pianocore_loader = pianocore_loader
+        self.pianocore_ratio = float(pianocore_ratio)
+        self.unpaired_loader = unpaired_loader
+        self.unpaired_ratio = float(unpaired_ratio)
+        self.rng = random.Random(seed)
+
+    @staticmethod
+    def _next(loader: DataLoader, state: dict, name: str):
+        try:
+            return next(state[name])
+        except (KeyError, StopIteration):
+            state[name] = iter(loader)
+            return next(state[name])
+
+    def __iter__(self):
+        state = {}
+        while True:
+            if self.unpaired_loader is not None and self.rng.random() < self.unpaired_ratio:
+                batch = self._next(self.unpaired_loader, state, "unpaired")
+            elif self.pianocore_loader is not None and self.rng.random() < self.pianocore_ratio:
+                batch = self._next(self.pianocore_loader, state, "pianocore")
+            else:
+                batch = self._next(self.asap_loader, state, "asap")
             yield batch[0], batch[1]
 
 class TrainRoformer(Roformer):
@@ -348,6 +397,32 @@ def main():
         default="/mnt/ssd/hbli/datasets/PDMX/render",
         help="Root directory of MusicRender-exported MIDI files",
     )
+    parser.add_argument(
+        "--pianocore_manifest",
+        type=str,
+        default="",
+        help="PianoCoRe manifest CSV for high-quality paired samples. Enable with --pianocore_ratio > 0.",
+    )
+    parser.add_argument(
+        "--pianocore_root",
+        type=str,
+        default="/mnt/ssd/hbli/datasets/pianocore/",
+        help="Root directory that contains PianoCoRe/raw files.",
+    )
+    parser.add_argument(
+        "--pianocore_ratio",
+        type=float,
+        default=0.0,
+        help="Probability of sampling PianoCoRe among paired batches after unpaired sampling.",
+    )
+    parser.add_argument("--pianocore_split", type=str, default="train")
+    parser.add_argument("--pianocore_cache_dir", type=str, default="")
+    parser.add_argument("--pianocore_max_rows", type=int, default=0)
+    parser.add_argument(
+        "--pianocore_no_require_chunk_file",
+        action="store_true",
+        help="Do not prefilter PianoCoRe manifest rows by existing *_pianocore_chunks.json files.",
+    )
 
     # training schedule
     parser.add_argument("--max_steps", type=int, default=40000)
@@ -419,7 +494,41 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
+    pianocore_loader = None
+    if args.pianocore_manifest and args.pianocore_ratio > 0:
+        pianocore_set = PianoCoReDataset(
+            manifest_path=args.pianocore_manifest,
+            pianocore_root=args.pianocore_root,
+            split=args.pianocore_split,
+            seq_length=args.seq_length,
+            cache=True,
+            cache_dir=args.pianocore_cache_dir,
+            padding="per-beat",
+            augmentations={
+                "transpose": 12,
+                "tempo_jitter": (0.8, 1.2),
+                "duration_jitter": (0.95, 1.05),
+                "onset_jitter": 0.05,
+                "random_crop": True,
+            },
+            return_continous=False,
+            require_chunk_file=(not args.pianocore_no_require_chunk_file),
+            max_rows=args.pianocore_max_rows,
+            skip_on_error=True,
+        )
+        print(f"PianoCoRe paired train samples: {len(pianocore_set)}")
+        pianocore_loader = DataLoader(
+            pianocore_set,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            shuffle=True,
+            drop_last=True,
+            persistent_workers=(args.num_workers > 0),
+        )
+
     # ---- Unpaired loader (optional) [ADDED]----
+    unpaired_loader = None
     if args.unpaired_list and os.path.exists(args.unpaired_list):
         unpaired_set = UnpairedXMLDataset(
             mxl_paths=args.unpaired_list,
@@ -440,10 +549,14 @@ def main():
             drop_last=True,
             persistent_workers=(args.num_workers > 0)
         )
-        train_loader = MixedBatchIterator(
-            paired_loader=paired_loader,
+
+    if pianocore_loader is not None or unpaired_loader is not None:
+        train_loader = MultiSourceBatchIterator(
+            asap_loader=paired_loader,
+            pianocore_loader=pianocore_loader,
+            pianocore_ratio=args.pianocore_ratio,
             unpaired_loader=unpaired_loader,
-            unpaired_ratio=args.unpaired_ratio,
+            unpaired_ratio=args.unpaired_ratio if unpaired_loader is not None else 0.0,
             seed=args.seed,
         )
     else:
