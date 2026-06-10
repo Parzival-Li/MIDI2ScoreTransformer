@@ -335,6 +335,60 @@ def _as_numpy_1d(x: Any, dtype=float) -> np.ndarray:
     return arr.reshape(-1).astype(dtype, copy=False)
 
 
+def _metadata_int(row: pd.Series, col: str) -> Optional[int]:
+    if col not in row or pd.isna(row[col]):
+        return None
+    try:
+        return int(round(float(row[col])))
+    except Exception:
+        return None
+
+
+def _identity_key(row: pd.Series) -> str:
+    row_id = row.get("id", "")
+    if row_id is not None and not pd.isna(row_id) and str(row_id):
+        return str(row_id)
+    return str(row.get("performance_midi_path", ""))
+
+
+def _load_identity_cache_keys(path: str) -> set[str]:
+    if not path:
+        return set()
+    df = pd.read_csv(path, low_memory=False)
+    if "chunk_status" in df.columns:
+        df = df[df["chunk_status"].astype(str).eq("ok")]
+    elif "chunk_path" in df.columns:
+        df = df[df["chunk_path"].notna()]
+    keys = set()
+    for _, row in df.iterrows():
+        keys.add(_identity_key(row))
+        if "performance_midi_path" in row and not pd.isna(row["performance_midi_path"]):
+            keys.add(str(row["performance_midi_path"]))
+    return keys
+
+
+def _trusted_by_existing_chunk(row: pd.Series, args) -> bool:
+    if not args.identity_cache_chunk_suffix:
+        return False
+    chunk_path = default_chunk_path(
+        row,
+        args.identity_cache_out_dir or args.out_dir,
+        args.pianocore_root,
+        args.identity_cache_chunk_location,
+        args.identity_cache_chunk_suffix,
+    )
+    return os.path.exists(chunk_path)
+
+
+def _is_identity_trusted(row: pd.Series, args) -> bool:
+    if not args.reuse_identity_cache:
+        return False
+    keys = getattr(args, "identity_cache_keys", set())
+    if keys and (_identity_key(row) in keys or str(row.get("performance_midi_path", "")) in keys):
+        return True
+    return _trusted_by_existing_chunk(row, args)
+
+
 def _score_onsets_from_xml(score_xml: Dict[str, Any]) -> np.ndarray:
     if "absolute_onset" not in score_xml:
         raise ValueError("parse_mxl output has no absolute_onset; tokenizer_v2 is required")
@@ -532,15 +586,52 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
         score_midi_path = resolve_path(row["score_midi_path"], args.pianocore_root)
         raw_alignment_path = str(row["raw_alignment_path"])
 
-        for p in [perf_midi_path, score_xml_path, score_midi_path]:
+        identity_trusted = _is_identity_trusted(row, args)
+        required_paths = [perf_midi_path, score_xml_path]
+        if not identity_trusted:
+            required_paths.append(score_midi_path)
+        for p in required_paths:
             if not os.path.exists(p):
                 raise FileNotFoundError(p)
 
-        perf, score_midi, score_xml = parse_streams(perf_midi_path, score_midi_path, score_xml_path)
         npz = read_npz(raw_alignment_path, args.pianocore_root, args.raw_alignments_zip)
-        pairs = extract_alignment_pairs(npz)
-        check = check_identity_mapping(perf, score_midi, score_xml, pairs)
-        pairs = check.pop("pairs_zero_based")
+        pairs_raw = extract_alignment_pairs(npz)
+
+        score_xml = None
+        if identity_trusted:
+            n_xml = _metadata_int(row, "score_note_count")
+            n_perf = _metadata_int(row, "performance_note_count")
+
+            if args.pseudo_beat_source == "xml_absolute_onset" or n_xml is None:
+                score_xml = MultistreamTokenizer.parse_mxl(score_xml_path)
+                n_xml = int(len(score_xml["pitch"]))
+            if n_perf is None:
+                perf = MultistreamTokenizer.parse_midi(perf_midi_path)
+                n_perf = int(len(perf["pitch"]))
+
+            pairs = normalize_index_base(pairs_raw, n_xml, n_perf)
+            matched = pairs[(pairs[:, 0] >= 0) & (pairs[:, 1] >= 0)]
+            max_score_idx = int(matched[:, 0].max()) if len(matched) else -1
+            max_perf_idx = int(matched[:, 1].max()) if len(matched) else -1
+            check = {
+                "n_perf": n_perf,
+                "n_score_midi": n_xml,
+                "n_xml": n_xml,
+                "n_pairs": int(len(pairs)),
+                "n_matched": int(len(matched)),
+                "max_score_idx": max_score_idx,
+                "max_perf_idx": max_perf_idx,
+                "score_len_equal": True,
+                "score_pitch_equal": True,
+                "perf_idx_in_bounds": max_perf_idx < n_perf,
+                "score_idx_in_bounds": max_score_idx < n_xml,
+                "identity_reused": True,
+            }
+        else:
+            perf, score_midi, score_xml = parse_streams(perf_midi_path, score_midi_path, score_xml_path)
+            check = check_identity_mapping(perf, score_midi, score_xml, pairs_raw)
+            pairs = check.pop("pairs_zero_based")
+            check["identity_reused"] = False
 
         if args.require_score_identity and not (check["score_len_equal"] and check["score_pitch_equal"]):
             raise RuntimeError(f"score MIDI != parse_mxl identity check failed: {check}")
@@ -561,6 +652,8 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
             )
         elif args.chunk_mode == "score_time":
             if args.pseudo_beat_source == "xml_absolute_onset":
+                if score_xml is None:
+                    score_xml = MultistreamTokenizer.parse_mxl(score_xml_path)
                 score_onsets = _score_onsets_from_xml(score_xml)
             elif args.pseudo_beat_source == "npz_score_times":
                 score_onsets = _score_onsets_from_npz(npz, check["n_xml"])
@@ -660,6 +753,31 @@ def main():
     ap.add_argument("--max-midi-mxl-ratio", type=float, default=0.0)
     ap.add_argument("--max-midi-notes-per-chunk", type=int, default=0)
     ap.add_argument("--min-monotonic-ratio", type=float, default=0.0)
+    ap.add_argument(
+        "--reuse-identity-cache",
+        action="store_true",
+        help="Trust previous strict identity results and skip score-MIDI vs parse_mxl rechecking for trusted rows.",
+    )
+    ap.add_argument(
+        "--identity-cache-manifest",
+        default="",
+        help="Previous chunker manifest. Rows with chunk_status == ok are trusted identity-pass rows.",
+    )
+    ap.add_argument(
+        "--identity-cache-chunk-suffix",
+        default="",
+        help="Trust rows whose previous chunk json exists with this suffix, e.g. _pianocore_chunks.json.",
+    )
+    ap.add_argument(
+        "--identity-cache-chunk-location",
+        choices=["next_to_midi", "out_dir"],
+        default="next_to_midi",
+    )
+    ap.add_argument(
+        "--identity-cache-out-dir",
+        default="",
+        help="Out dir for previous chunk jsons when --identity-cache-chunk-location out_dir is used.",
+    )
     ap.add_argument("--require-score-identity", action="store_true", default=True)
     ap.add_argument("--no-require-score-identity", dest="require_score_identity", action="store_false")
     args = ap.parse_args()
@@ -674,6 +792,8 @@ def main():
         args.max_midi_notes_per_chunk = 0 if args.chunk_mode == "note_count" else 128
     if args.min_monotonic_ratio <= 0:
         args.min_monotonic_ratio = 0.0 if args.chunk_mode == "note_count" else 0.95
+
+    args.identity_cache_keys = _load_identity_cache_keys(args.identity_cache_manifest)
 
     os.makedirs(args.out_dir, exist_ok=True)
     df = pd.read_csv(args.manifest, low_memory=False)
