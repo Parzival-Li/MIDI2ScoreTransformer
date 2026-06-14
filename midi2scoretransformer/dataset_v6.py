@@ -474,6 +474,7 @@ class PianoCoReDataset(Dataset):
         max_retries: int = 50,
         fail_log_path: str = "",
         fail_log_flush: bool = True,
+        respect_alignment_segments: bool = True,
     ):
         super().__init__()
         assert padding in ("per-beat", "end", None)
@@ -492,6 +493,7 @@ class PianoCoReDataset(Dataset):
         self.skip_on_error = bool(skip_on_error)
         self.max_retries = int(max_retries)
         self.fail_log_flush = bool(fail_log_flush)
+        self.respect_alignment_segments = bool(respect_alignment_segments)
 
         self.metadata = self._load_manifest(self.manifest_path, split, split_col)
         if len(self.metadata) == 0:
@@ -619,6 +621,18 @@ class PianoCoReDataset(Dataset):
         raise ValueError("Invalid random_crop value")
 
     @staticmethod
+    def _alignment_segment_ids(chunk_annots: Dict[str, list]) -> Optional[list]:
+        segment_ids = chunk_annots.get("alignment_segment_id")
+        if segment_ids is None:
+            return None
+        n_chunks = len(chunk_annots["midi"])
+        if len(segment_ids) != n_chunks:
+            raise ValueError(
+                f"Invalid alignment_segment_id length={len(segment_ids)} for n_chunks={n_chunks}"
+            )
+        return segment_ids
+
+    @staticmethod
     def _process_chunk(stream: Dict[str, torch.Tensor], chunk: list, padding, length: int):
         if len(chunk) == 0:
             # Empty side in a paired chunk is not useful for this model.
@@ -686,11 +700,20 @@ class PianoCoReDataset(Dataset):
 
         chunk_annots = self._load_chunks(chunk_path)
         n_0 = self._choose_start_chunk(chunk_annots)
+        segment_ids = self._alignment_segment_ids(chunk_annots)
+        active_segment_id = None
+        if self.respect_alignment_segments and segment_ids is not None:
+            active_segment_id = segment_ids[n_0]
 
         new_input_stream = None
         new_output_stream = None
         extra_shift = int(self.augmentations.get("random_shift", 0) or 0)
-        for midi_chunk, mxl_chunk in zip(chunk_annots["midi"][n_0:], chunk_annots["mxl"][n_0:]):
+        for chunk_i, (midi_chunk, mxl_chunk) in enumerate(
+            zip(chunk_annots["midi"][n_0:], chunk_annots["mxl"][n_0:]),
+            start=n_0,
+        ):
+            if active_segment_id is not None and segment_ids[chunk_i] != active_segment_id:
+                break
             length = max(len(midi_chunk), len(mxl_chunk))
             if length == 0:
                 continue

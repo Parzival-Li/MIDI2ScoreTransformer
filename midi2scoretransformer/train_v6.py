@@ -423,6 +423,11 @@ def main():
         action="store_true",
         help="Do not prefilter PianoCoRe manifest rows by existing *_pianocore_chunks.json files.",
     )
+    parser.add_argument(
+        "--pianocore_ignore_alignment_segments",
+        action="store_true",
+        help="Allow PianoCoRe training samples to concatenate across alignment_segment_id boundaries.",
+    )
 
     # training schedule
     parser.add_argument("--max_steps", type=int, default=40000)
@@ -515,6 +520,7 @@ def main():
             require_chunk_file=(not args.pianocore_no_require_chunk_file),
             max_rows=args.pianocore_max_rows,
             skip_on_error=True,
+            respect_alignment_segments=(not args.pianocore_ignore_alignment_segments),
         )
         print(f"PianoCoRe paired train samples: {len(pianocore_set)}")
         pianocore_loader = DataLoader(
