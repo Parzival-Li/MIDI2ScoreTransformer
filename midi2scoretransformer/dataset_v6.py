@@ -475,9 +475,12 @@ class PianoCoReDataset(Dataset):
         fail_log_path: str = "",
         fail_log_flush: bool = True,
         respect_alignment_segments: bool = True,
+        sample_unit: str = "row",
     ):
         super().__init__()
         assert padding in ("per-beat", "end", None)
+        if sample_unit not in {"row", "chunk"}:
+            raise ValueError(f"Invalid PianoCoRe sample_unit={sample_unit}. Must be 'row' or 'chunk'.")
         self.manifest_path = str(manifest_path)
         self.pianocore_root = str(Path(pianocore_root).resolve())
         self.split = split
@@ -494,6 +497,7 @@ class PianoCoReDataset(Dataset):
         self.max_retries = int(max_retries)
         self.fail_log_flush = bool(fail_log_flush)
         self.respect_alignment_segments = bool(respect_alignment_segments)
+        self.sample_unit = sample_unit
 
         self.metadata = self._load_manifest(self.manifest_path, split, split_col)
         if len(self.metadata) == 0:
@@ -509,6 +513,7 @@ class PianoCoReDataset(Dataset):
             fail_log_path = os.path.join(self.cache_dir, "pianocore_dataset_failures.log")
         self.fail_log_path = fail_log_path
         os.makedirs(os.path.dirname(os.path.abspath(self.fail_log_path)), exist_ok=True)
+        self.sample_index = self._build_sample_index()
 
     def _load_manifest(self, manifest_path: str, split: str, split_col: str) -> pd.DataFrame:
         df = pd.read_csv(manifest_path, low_memory=False)
@@ -543,7 +548,43 @@ class PianoCoReDataset(Dataset):
         return df
 
     def __len__(self) -> int:
+        if self.sample_index is not None:
+            return len(self.sample_index)
         return len(self.metadata)
+
+    def _build_sample_index(self) -> Optional[list[dict[str, int]]]:
+        if self.sample_unit == "row":
+            return None
+
+        sample_index: list[dict[str, int]] = []
+        for row_idx, sample in self.metadata.iterrows():
+            row_id = str(sample.get("id", row_idx))
+            try:
+                chunk_path = self._resolve_path(sample["chunk_path"])
+                chunk_annots = self._load_chunks(chunk_path)
+                n_chunks = min(len(chunk_annots["midi"]), len(chunk_annots["mxl"]))
+                for chunk_idx in range(n_chunks):
+                    if len(chunk_annots["midi"][chunk_idx]) == 0 or len(chunk_annots["mxl"][chunk_idx]) == 0:
+                        continue
+                    sample_index.append({"row_idx": int(row_idx), "chunk_idx": int(chunk_idx)})
+            except Exception as e:
+                if not self.skip_on_error:
+                    raise
+                self._log_failure(row_id, e)
+
+        if len(sample_index) == 0:
+            raise ValueError(f"PianoCoReDataset sample_unit={self.sample_unit} produced no sample units")
+        return sample_index
+
+    def _row_and_start_chunk(self, idx: int) -> tuple[int, Optional[int]]:
+        if self.sample_index is None:
+            return int(idx), None
+        entry = self.sample_index[int(idx)]
+        return int(entry["row_idx"]), int(entry["chunk_idx"])
+
+    def _row_id_for_item(self, idx: int) -> str:
+        row_idx, _ = self._row_and_start_chunk(idx)
+        return str(self.metadata.iloc[row_idx].get("id", row_idx))
 
     def _resolve_path(self, path_like: str) -> str:
         p = Path(str(path_like))
@@ -643,8 +684,9 @@ class PianoCoReDataset(Dataset):
         return {k: v[idx] for k, v in stream.items()}
 
     def _get_one(self, idx: int):
-        sample = self.metadata.iloc[idx]
-        row_id = str(sample.get("id", idx))
+        row_idx, fixed_start_chunk = self._row_and_start_chunk(idx)
+        sample = self.metadata.iloc[row_idx]
+        row_id = str(sample.get("id", row_idx))
         performance_midi_path = self._resolve_path(sample["performance_midi_path"])
         score_xml_path = self._resolve_path(sample["score_xml_path"])
         chunk_path = self._resolve_path(sample["chunk_path"])
@@ -699,7 +741,7 @@ class PianoCoReDataset(Dataset):
             seq_length = max(len(input_stream["onset"]), len(output_stream["offset"])) + 256
 
         chunk_annots = self._load_chunks(chunk_path)
-        n_0 = self._choose_start_chunk(chunk_annots)
+        n_0 = fixed_start_chunk if fixed_start_chunk is not None else self._choose_start_chunk(chunk_annots)
         segment_ids = self._alignment_segment_ids(chunk_annots)
         active_segment_id = None
         if self.respect_alignment_segments and segment_ids is not None:
@@ -755,13 +797,13 @@ class PianoCoReDataset(Dataset):
         last_err = None
         cur = idx
         for _ in range(self.max_retries):
-            row_id = str(self.metadata.iloc[cur].get("id", cur))
+            row_id = self._row_id_for_item(cur)
             try:
                 return self._get_one(cur)
             except Exception as e:
                 last_err = e
                 self._log_failure(row_id, e)
-                cur = random.randint(0, len(self.metadata) - 1)
+                cur = random.randint(0, len(self) - 1)
         raise RuntimeError(
             f"PianoCoReDataset: failed to get a valid sample after {self.max_retries} retries. "
             f"Last error: {repr(last_err)}"

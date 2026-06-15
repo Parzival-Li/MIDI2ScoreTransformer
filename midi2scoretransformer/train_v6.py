@@ -428,6 +428,13 @@ def main():
         action="store_true",
         help="Allow PianoCoRe training samples to concatenate across alignment_segment_id boundaries.",
     )
+    parser.add_argument(
+        "--pianocore_sample_unit",
+        type=str,
+        default="row",
+        choices=["row", "chunk"],
+        help="Sample PianoCoRe by manifest row or by chunk/window entry in the chunk json.",
+    )
 
     # training schedule
     parser.add_argument("--max_steps", type=int, default=40000)
@@ -521,8 +528,12 @@ def main():
             max_rows=args.pianocore_max_rows,
             skip_on_error=True,
             respect_alignment_segments=(not args.pianocore_ignore_alignment_segments),
+            sample_unit=args.pianocore_sample_unit,
         )
-        print(f"PianoCoRe paired train samples: {len(pianocore_set)}")
+        print(
+            f"PianoCoRe paired train rows: {len(pianocore_set.metadata)}; "
+            f"sample units ({args.pianocore_sample_unit}): {len(pianocore_set)}"
+        )
         pianocore_loader = DataLoader(
             pianocore_set,
             batch_size=args.batch_size,
