@@ -968,6 +968,11 @@ def main():
     ap.add_argument("--max-rows", type=int, default=0)
     ap.add_argument("--n-jobs", type=int, default=8)
     ap.add_argument(
+        "--manifest-status-filter",
+        default="",
+        help="If set, keep only input manifest rows whose chunk_status equals this value, e.g. ok.",
+    )
+    ap.add_argument(
         "--chunk-mode",
         choices=["note_count", "score_time", "alignment_segment"],
         default="note_count",
@@ -1083,6 +1088,10 @@ def main():
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"manifest missing columns: {missing}")
+    if args.manifest_status_filter:
+        if "chunk_status" not in df.columns:
+            raise ValueError("--manifest-status-filter requires an input manifest with a chunk_status column")
+        df = df[df["chunk_status"].astype(str).eq(args.manifest_status_filter)].copy()
     if args.max_rows and args.max_rows > 0:
         df = df.head(args.max_rows).copy()
 
