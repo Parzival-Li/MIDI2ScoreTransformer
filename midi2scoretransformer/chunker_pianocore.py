@@ -433,7 +433,7 @@ def make_score_time_chunks(
     context_perf_notes: int = 0,
     max_midi_mxl_ratio: float = 4.0,
     max_midi_notes_per_chunk: int = 128,
-    min_monotonic_ratio: float = 0.95,
+    min_monotonic_ratio: float = 0.01,
 ) -> Dict[str, Any]:
     """
     Generate PM2S chunks from score-side time bins plus PianoCoRe note alignment.
@@ -547,36 +547,41 @@ def make_alignment_segment_chunks(
     n_xml: int,
     n_perf: int,
     pairs: np.ndarray,
-    segment_window_notes: int = 512,
-    segment_window_overlap: int = 0,
+    score_onsets: np.ndarray,
+    beat_quarter_len: float = 1.0,
+    beats_per_chunk: int = 1,
     min_segment_mxl_notes: int = 64,
-    min_window_mxl_notes: int = 64,
-    min_midi_notes: int = 16,
+    min_mxl_notes: int = 1,
+    min_midi_notes: int = 1,
     min_matched_score_ratio: float = 0.70,
     min_matched_perf_ratio: float = 0.30,
     context_perf_notes: int = 0,
     max_midi_mxl_ratio: float = 4.0,
-    max_midi_notes_per_chunk: int = 1024,
-    min_monotonic_ratio: float = 0.90,
+    max_midi_notes_per_chunk: int = 128,
+    min_monotonic_ratio: float = 0.95,
     max_unmatched_score_gap: int = 16,
     max_unmatched_perf_gap: int = 64,
     max_perf_backtrack: int = 8,
 ) -> Dict[str, Any]:
     """
-    Generate chunks from contiguous local note-alignment regions.
+    Generate pseudo-beat chunks and guard training against skipped bad regions.
 
-    This mode avoids sparse pseudo-beat concatenation. It first scans PianoCoRe
-    score-note -> performance-note anchors and cuts an alignment_segment whenever
-    the local mapping becomes too sparse or strongly non-monotonic. Each retained
-    segment is then split into score-note windows. Training can concatenate only
-    windows with the same alignment_segment_id.
+    Each chunk is one score-time bin (or a small group of bins) exactly like
+    make_score_time_chunks. The extra alignment_segment_id is not a note-window;
+    it marks a run of consecutive accepted pseudo-beat chunks. If any non-empty
+    score-time bin is rejected by chunk-level filters, or if the performance
+    indices jump/backtrack too far, the next accepted chunk starts a new segment.
+    Training may concatenate chunks only inside one segment, so it cannot jump
+    across a discarded local region.
     """
     if n_xml <= 0 or n_perf <= 0:
         return {"midi": [], "mxl": [], "swapped": False, "source": "pianocore_raw_alignment"}
-    if segment_window_notes <= 0:
-        raise ValueError("--segment-window-notes must be positive")
-    if segment_window_overlap < 0 or segment_window_overlap >= segment_window_notes:
-        raise ValueError("--segment-window-overlap must satisfy 0 <= overlap < window_notes")
+    if len(score_onsets) != n_xml:
+        raise ValueError(f"score_onsets len={len(score_onsets)} does not match n_xml={n_xml}")
+    if beat_quarter_len <= 0:
+        raise ValueError("--beat-quarter-len must be positive")
+    if beats_per_chunk <= 0:
+        raise ValueError("--beats-per-chunk must be positive")
 
     pairs = pairs.astype(np.int64, copy=False)
     matched = pairs[(pairs[:, 0] >= 0) & (pairs[:, 1] >= 0)]
@@ -588,172 +593,211 @@ def make_alignment_segment_chunks(
             score_to_perf.setdefault(int(s), []).append(int(p))
             perf_to_score.setdefault(int(p), []).append(int(s))
 
-    anchors = sorted((s, min(ps)) for s, ps in score_to_perf.items() if ps)
-    if not anchors:
+    width = float(beat_quarter_len) * int(beats_per_chunk)
+    finite_onsets = score_onsets[np.isfinite(score_onsets)]
+    if len(finite_onsets) == 0:
+        raise ValueError("No finite score onset values")
+
+    start_bin = int(np.floor(float(finite_onsets.min()) / width))
+    end_bin = int(np.floor(float(finite_onsets.max()) / width))
+
+    accepted: list[dict[str, Any]] = []
+    rejected_nonempty_bins: set[int] = set()
+    rejection_counts: dict[str, int] = {}
+
+    def reject(bin_id: int, reason: str):
+        rejected_nonempty_bins.add(int(bin_id))
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    for b in range(start_bin, end_bin + 1):
+        t0 = b * width
+        t1 = t0 + width
+        if b == end_bin:
+            mxl_idx = np.where((score_onsets >= t0) & (score_onsets <= t1))[0]
+        else:
+            mxl_idx = np.where((score_onsets >= t0) & (score_onsets < t1))[0]
+        mxl_chunk = [int(i) for i in mxl_idx if 0 <= int(i) < n_xml]
+        if len(mxl_chunk) == 0:
+            continue
+        if len(mxl_chunk) < min_mxl_notes:
+            reject(b, "min_mxl_notes")
+            continue
+
+        perf_matched = sorted({p for s in mxl_chunk for p in score_to_perf.get(s, [])})
+        if not perf_matched:
+            reject(b, "no_matched_perf")
+            continue
+
+        p0 = max(min(perf_matched) - context_perf_notes, 0)
+        p1 = min(max(perf_matched) + context_perf_notes + 1, n_perf)
+        midi_chunk = list(range(p0, p1))
+        if len(midi_chunk) < min_midi_notes:
+            reject(b, "min_midi_notes")
+            continue
+        if max_midi_notes_per_chunk > 0 and len(midi_chunk) > max_midi_notes_per_chunk:
+            reject(b, "max_midi_notes_per_chunk")
+            continue
+        if max_midi_mxl_ratio > 0 and len(midi_chunk) / max(len(mxl_chunk), 1) > max_midi_mxl_ratio:
+            reject(b, "max_midi_mxl_ratio")
+            continue
+
+        matched_score_ratio = len([s for s in mxl_chunk if s in score_to_perf]) / max(len(mxl_chunk), 1)
+        matched_perf_in_chunk = [p for p in midi_chunk if any(s in mxl_chunk for s in perf_to_score.get(p, []))]
+        matched_perf_ratio = len(matched_perf_in_chunk) / max(len(midi_chunk), 1)
+
+        perf_for_score = []
+        for s in mxl_chunk:
+            ps = score_to_perf.get(s, [])
+            if ps:
+                perf_for_score.append(min(ps))
+        if len(perf_for_score) <= 1:
+            monotonic_ratio = 1.0
+        else:
+            monotonic_ratio = float(np.mean(np.diff(np.asarray(perf_for_score)) >= 0))
+
+        if matched_score_ratio < min_matched_score_ratio:
+            reject(b, "min_matched_score_ratio")
+            continue
+        if matched_perf_ratio < min_matched_perf_ratio:
+            reject(b, "min_matched_perf_ratio")
+            continue
+        if monotonic_ratio < min_monotonic_ratio:
+            reject(b, "min_monotonic_ratio")
+            continue
+
+        accepted.append({
+            "score_bin": int(b),
+            "score_time_start": float(t0),
+            "score_time_end": float(t1),
+            "midi": midi_chunk,
+            "mxl": mxl_chunk,
+            "midi_start": int(p0),
+            "midi_end": int(p1),
+            "mxl_start": int(min(mxl_chunk)),
+            "mxl_end": int(max(mxl_chunk) + 1),
+            "n_mxl": len(mxl_chunk),
+            "n_midi": len(midi_chunk),
+            "matched_score_ratio": matched_score_ratio,
+            "matched_perf_ratio": matched_perf_ratio,
+            "monotonic_ratio": monotonic_ratio,
+        })
+
+    if not accepted:
         return {
             "midi": [],
             "mxl": [],
             "swapped": False,
             "source": "pianocore_raw_alignment",
-            "chunk_unit": "alignment_segment_window",
+            "chunk_unit": "score_time_pseudo_beat_segment_guard",
+            "beat_quarter_len": float(beat_quarter_len),
+            "beats_per_chunk": int(beats_per_chunk),
             "stats": [],
             "alignment_segment_id": [],
+            "rejection_counts": rejection_counts,
+            "n_rejected_score_time_bins": len(rejected_nonempty_bins),
         }
 
-    raw_segments: list[dict[str, int]] = []
-    seg_start_s = anchors[0][0]
-    prev_s, prev_p = anchors[0]
-    seg_p_min = prev_p
-    seg_p_max = prev_p
-    seg_anchor_count = 1
+    def has_rejected_gap(prev_bin: int, cur_bin: int) -> bool:
+        if cur_bin <= prev_bin + 1:
+            return False
+        return any(prev_bin < b < cur_bin for b in rejected_nonempty_bins)
 
-    def close_segment():
-        raw_segments.append({
-            "score_start": int(seg_start_s),
-            "score_end": int(prev_s + 1),
-            "perf_start": int(seg_p_min),
-            "perf_end": int(seg_p_max + 1),
-            "anchor_count": int(seg_anchor_count),
-        })
+    raw_segments: list[list[dict[str, Any]]] = []
+    cur_segment: list[dict[str, Any]] = []
+    prev: Optional[dict[str, Any]] = None
+    for item in accepted:
+        should_break = prev is None
+        break_reason = "first_chunk" if should_break else ""
+        if prev is not None:
+            score_note_gap = int(item["mxl_start"] - prev["mxl_end"])
+            perf_forward_gap = int(item["midi_start"] - prev["midi_end"]) if item["midi_start"] >= prev["midi_end"] else 0
+            perf_backtrack = int(prev["midi_end"] - item["midi_start"]) if item["midi_start"] < prev["midi_end"] else 0
 
-    for s, p in anchors[1:]:
-        score_gap = int(s - prev_s - 1)
-        perf_forward_gap = int(p - prev_p - 1) if p >= prev_p else 0
-        perf_backtrack = int(prev_p - p) if p < prev_p else 0
+            if has_rejected_gap(prev["score_bin"], item["score_bin"]):
+                should_break = True
+                break_reason = "rejected_score_time_bin"
+            elif max_unmatched_score_gap >= 0 and score_note_gap > max_unmatched_score_gap:
+                should_break = True
+                break_reason = "score_note_gap"
+            elif max_unmatched_perf_gap >= 0 and perf_forward_gap > max_unmatched_perf_gap:
+                should_break = True
+                break_reason = "perf_note_gap"
+            elif max_perf_backtrack >= 0 and perf_backtrack > max_perf_backtrack:
+                should_break = True
+                break_reason = "perf_backtrack"
 
-        should_break = False
-        if max_unmatched_score_gap >= 0 and score_gap > max_unmatched_score_gap:
-            should_break = True
-        if max_unmatched_perf_gap >= 0 and perf_forward_gap > max_unmatched_perf_gap:
-            should_break = True
-        if max_perf_backtrack >= 0 and perf_backtrack > max_perf_backtrack:
-            should_break = True
-
+        item["segment_break_reason"] = break_reason
         if should_break:
-            close_segment()
-            seg_start_s = int(s)
-            seg_p_min = int(p)
-            seg_p_max = int(p)
-            seg_anchor_count = 1
+            if cur_segment:
+                raw_segments.append(cur_segment)
+            cur_segment = [item]
         else:
-            seg_p_min = min(seg_p_min, int(p))
-            seg_p_max = max(seg_p_max, int(p))
-            seg_anchor_count += 1
-        prev_s, prev_p = int(s), int(p)
-    close_segment()
+            cur_segment.append(item)
+        prev = item
+    if cur_segment:
+        raw_segments.append(cur_segment)
 
     midi_chunks: list[list[int]] = []
     mxl_chunks: list[list[int]] = []
     alignment_segment_ids: list[int] = []
     stats: list[dict[str, Any]] = []
 
-    stride = segment_window_notes - segment_window_overlap
     kept_segment_id = 0
-    for raw_segment in raw_segments:
-        seg_score_start = raw_segment["score_start"]
-        seg_score_end = raw_segment["score_end"]
-        seg_mxl_len = seg_score_end - seg_score_start
-        if seg_mxl_len < min_segment_mxl_notes:
+    dropped_short_segments = 0
+    for segment in raw_segments:
+        segment_n_mxl = sum(int(item["n_mxl"]) for item in segment)
+        if segment_n_mxl < min_segment_mxl_notes:
+            dropped_short_segments += 1
             continue
 
-        window_start = seg_score_start
-        window_id = 0
-        segment_had_window = False
-        while window_start < seg_score_end:
-            window_end = min(window_start + segment_window_notes, seg_score_end)
-            if window_end - window_start < min_window_mxl_notes:
-                break
+        segment_score_start = min(int(item["mxl_start"]) for item in segment)
+        segment_score_end = max(int(item["mxl_end"]) for item in segment)
+        segment_perf_start = min(int(item["midi_start"]) for item in segment)
+        segment_perf_end = max(int(item["midi_end"]) for item in segment)
 
-            mxl_chunk = list(range(window_start, window_end))
-            perf_matched = sorted({p for s in mxl_chunk for p in score_to_perf.get(s, [])})
-            if not perf_matched:
-                if window_end == seg_score_end:
-                    break
-                window_start += stride
-                window_id += 1
-                continue
-
-            p0 = max(min(perf_matched) - context_perf_notes, 0)
-            p1 = min(max(perf_matched) + context_perf_notes + 1, n_perf)
-            midi_chunk = list(range(p0, p1))
-            if len(midi_chunk) < min_midi_notes:
-                if window_end == seg_score_end:
-                    break
-                window_start += stride
-                window_id += 1
-                continue
-            if max_midi_notes_per_chunk > 0 and len(midi_chunk) > max_midi_notes_per_chunk:
-                if window_end == seg_score_end:
-                    break
-                window_start += stride
-                window_id += 1
-                continue
-            if max_midi_mxl_ratio > 0 and len(midi_chunk) / max(len(mxl_chunk), 1) > max_midi_mxl_ratio:
-                if window_end == seg_score_end:
-                    break
-                window_start += stride
-                window_id += 1
-                continue
-
-            matched_score_ratio = len([s for s in mxl_chunk if s in score_to_perf]) / max(len(mxl_chunk), 1)
-            matched_perf_in_chunk = [p for p in midi_chunk if any(window_start <= s < window_end for s in perf_to_score.get(p, []))]
-            matched_perf_ratio = len(matched_perf_in_chunk) / max(len(midi_chunk), 1)
-
-            perf_for_score = []
-            for s in mxl_chunk:
-                ps = score_to_perf.get(s, [])
-                if ps:
-                    perf_for_score.append(min(ps))
-            if len(perf_for_score) <= 1:
-                monotonic_ratio = 1.0
-            else:
-                monotonic_ratio = float(np.mean(np.diff(np.asarray(perf_for_score)) >= -max_perf_backtrack))
-
-            if (
-                matched_score_ratio >= min_matched_score_ratio
-                and matched_perf_ratio >= min_matched_perf_ratio
-                and monotonic_ratio >= min_monotonic_ratio
-            ):
-                midi_chunks.append(midi_chunk)
-                mxl_chunks.append(mxl_chunk)
-                alignment_segment_ids.append(kept_segment_id)
-                stats.append({
-                    "alignment_segment_id": kept_segment_id,
-                    "alignment_window_id": window_id,
-                    "segment_score_start": seg_score_start,
-                    "segment_score_end": seg_score_end,
-                    "segment_perf_start": raw_segment["perf_start"],
-                    "segment_perf_end": raw_segment["perf_end"],
-                    "mxl_start": window_start,
-                    "mxl_end": window_end,
-                    "midi_start": p0,
-                    "midi_end": p1,
-                    "n_mxl": len(mxl_chunk),
-                    "n_midi": len(midi_chunk),
-                    "matched_score_ratio": matched_score_ratio,
-                    "matched_perf_ratio": matched_perf_ratio,
-                    "monotonic_ratio": monotonic_ratio,
-                })
-                segment_had_window = True
-
-            if window_end == seg_score_end:
-                break
-            window_start += stride
-            window_id += 1
-
-        if segment_had_window:
-            kept_segment_id += 1
+        for local_chunk_id, item in enumerate(segment):
+            midi_chunks.append(item["midi"])
+            mxl_chunks.append(item["mxl"])
+            alignment_segment_ids.append(kept_segment_id)
+            stats.append({
+                "alignment_segment_id": kept_segment_id,
+                "segment_chunk_id": local_chunk_id,
+                "segment_score_start": segment_score_start,
+                "segment_score_end": segment_score_end,
+                "segment_perf_start": segment_perf_start,
+                "segment_perf_end": segment_perf_end,
+                "segment_n_chunks": len(segment),
+                "segment_n_mxl": segment_n_mxl,
+                "score_bin": item["score_bin"],
+                "score_time_start": item["score_time_start"],
+                "score_time_end": item["score_time_end"],
+                "mxl_start": item["mxl_start"],
+                "mxl_end": item["mxl_end"],
+                "midi_start": item["midi_start"],
+                "midi_end": item["midi_end"],
+                "n_mxl": item["n_mxl"],
+                "n_midi": item["n_midi"],
+                "matched_score_ratio": item["matched_score_ratio"],
+                "matched_perf_ratio": item["matched_perf_ratio"],
+                "monotonic_ratio": item["monotonic_ratio"],
+                "segment_break_reason": item["segment_break_reason"],
+            })
+        kept_segment_id += 1
 
     return {
         "midi": midi_chunks,
         "mxl": mxl_chunks,
         "swapped": False,
         "source": "pianocore_raw_alignment",
-        "chunk_unit": "alignment_segment_window",
-        "segment_window_notes": int(segment_window_notes),
-        "segment_window_overlap": int(segment_window_overlap),
+        "chunk_unit": "score_time_pseudo_beat_segment_guard",
+        "beat_quarter_len": float(beat_quarter_len),
+        "beats_per_chunk": int(beats_per_chunk),
+        "min_segment_mxl_notes": int(min_segment_mxl_notes),
         "alignment_segment_id": alignment_segment_ids,
         "stats": stats,
+        "rejection_counts": rejection_counts,
+        "n_rejected_score_time_bins": len(rejected_nonempty_bins),
+        "n_dropped_short_segments": dropped_short_segments,
     }
 
 
@@ -816,7 +860,10 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
             n_xml = _metadata_int(row, "score_note_count")
             n_perf = _metadata_int(row, "performance_note_count")
 
-            needs_xml_onsets = args.chunk_mode == "score_time" and args.pseudo_beat_source == "xml_absolute_onset"
+            needs_xml_onsets = (
+                args.chunk_mode in {"score_time", "alignment_segment"}
+                and args.pseudo_beat_source == "xml_absolute_onset"
+            )
             if needs_xml_onsets or n_xml is None:
                 score_xml = MultistreamTokenizer.parse_mxl(score_xml_path)
                 n_xml = int(len(score_xml["pitch"]))
@@ -892,14 +939,24 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
                 min_monotonic_ratio=args.min_monotonic_ratio,
             )
         elif args.chunk_mode == "alignment_segment":
+            if args.pseudo_beat_source == "xml_absolute_onset":
+                if score_xml is None:
+                    score_xml = MultistreamTokenizer.parse_mxl(score_xml_path)
+                score_onsets = _score_onsets_from_xml(score_xml)
+            elif args.pseudo_beat_source == "npz_score_times":
+                score_onsets = _score_onsets_from_npz(npz, check["n_xml"])
+            else:
+                raise ValueError(f"Invalid pseudo_beat_source={args.pseudo_beat_source}")
+
             chunks = make_alignment_segment_chunks(
                 n_xml=check["n_xml"],
                 n_perf=check["n_perf"],
                 pairs=pairs,
-                segment_window_notes=args.segment_window_notes,
-                segment_window_overlap=args.segment_window_overlap,
+                score_onsets=score_onsets,
+                beat_quarter_len=args.beat_quarter_len,
+                beats_per_chunk=args.beats_per_chunk,
                 min_segment_mxl_notes=args.min_segment_mxl_notes,
-                min_window_mxl_notes=args.min_mxl_notes,
+                min_mxl_notes=args.min_mxl_notes,
                 min_midi_notes=args.min_midi_notes,
                 min_matched_score_ratio=args.min_matched_score_ratio,
                 min_matched_perf_ratio=args.min_matched_perf_ratio,
@@ -978,37 +1035,48 @@ def main():
         default="note_count",
         help=(
             "note_count keeps the old 512-target-note chunks; score_time builds pseudo-beat chunks "
-            "from score onsets; alignment_segment builds contiguous local note-alignment windows."
+            "from score onsets; alignment_segment builds pseudo-beat chunks and assigns continuous "
+            "segment ids so training cannot concatenate across rejected local regions."
         ),
     )
     ap.add_argument("--note-chunk-size", type=int, default=512)
     ap.add_argument("--beat-quarter-len", type=float, default=1.0)
     ap.add_argument("--beats-per-chunk", type=int, default=1)
-    ap.add_argument("--segment-window-notes", type=int, default=512)
-    ap.add_argument("--segment-window-overlap", type=int, default=0)
+    ap.add_argument(
+        "--segment-window-notes",
+        type=int,
+        default=512,
+        help="Deprecated compatibility option; ignored by alignment_segment mode.",
+    )
+    ap.add_argument(
+        "--segment-window-overlap",
+        type=int,
+        default=0,
+        help="Deprecated compatibility option; ignored by alignment_segment mode.",
+    )
     ap.add_argument(
         "--min-segment-mxl-notes",
         type=int,
         default=0,
-        help="Minimum XML notes for a retained alignment segment before it is split into windows.",
+        help="Minimum total XML notes for a retained continuous pseudo-beat segment.",
     )
     ap.add_argument(
         "--max-unmatched-score-gap",
         type=int,
         default=16,
-        help="Break an alignment segment after this many consecutive score notes without matched anchors.",
+        help="Break a continuous segment when adjacent accepted chunks skip more score notes than this.",
     )
     ap.add_argument(
         "--max-unmatched-perf-gap",
         type=int,
         default=64,
-        help="Break an alignment segment after this many consecutive performance notes between matched anchors.",
+        help="Break a continuous segment when adjacent accepted chunks skip more performance notes than this.",
     )
     ap.add_argument(
         "--max-perf-backtrack",
         type=int,
         default=8,
-        help="Allowed local non-monotonicity in performance-note indices inside an alignment segment.",
+        help="Break a continuous segment when adjacent accepted chunks overlap/backtrack by more notes than this.",
     )
     ap.add_argument(
         "--pseudo-beat-source",
@@ -1055,30 +1123,30 @@ def main():
     if args.min_mxl_notes <= 0:
         if args.chunk_mode == "note_count":
             args.min_mxl_notes = 16
-        elif args.chunk_mode == "score_time":
+        elif args.chunk_mode in {"score_time", "alignment_segment"}:
             args.min_mxl_notes = 1
         else:
             args.min_mxl_notes = 64
     if args.min_midi_notes <= 0:
-        args.min_midi_notes = 16 if args.chunk_mode in {"note_count", "alignment_segment"} else 1
+        args.min_midi_notes = 16 if args.chunk_mode == "note_count" else 1
     if args.min_segment_mxl_notes <= 0:
-        args.min_segment_mxl_notes = args.min_mxl_notes if args.chunk_mode == "alignment_segment" else 0
+        args.min_segment_mxl_notes = 64 if args.chunk_mode == "alignment_segment" else 0
     if args.max_midi_mxl_ratio <= 0:
         args.max_midi_mxl_ratio = 0.0 if args.chunk_mode == "note_count" else 4.0
     if args.max_midi_notes_per_chunk <= 0:
         if args.chunk_mode == "note_count":
             args.max_midi_notes_per_chunk = 0
-        elif args.chunk_mode == "score_time":
-            args.max_midi_notes_per_chunk = 128
         else:
-            args.max_midi_notes_per_chunk = 1024
+            args.max_midi_notes_per_chunk = 128
     if args.min_monotonic_ratio <= 0:
         if args.chunk_mode == "note_count":
             args.min_monotonic_ratio = 0.0
         elif args.chunk_mode == "score_time":
             args.min_monotonic_ratio = 0.95
         else:
-            args.min_monotonic_ratio = 0.90
+            # Pseudo-beat chunks are tiny, so strict local monotonicity splits
+            # ordinary polyphonic passages into many unusably short segments.
+            args.min_monotonic_ratio = 0.01
 
     args.identity_cache_keys = _load_identity_cache_keys(args.identity_cache_manifest)
 
