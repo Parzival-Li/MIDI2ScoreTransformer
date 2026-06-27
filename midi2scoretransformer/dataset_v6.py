@@ -476,11 +476,15 @@ class PianoCoReDataset(Dataset):
         fail_log_flush: bool = True,
         respect_alignment_segments: bool = True,
         sample_unit: str = "row",
+        min_valid_start_len: int = 384,
     ):
         super().__init__()
         assert padding in ("per-beat", "end", None)
-        if sample_unit not in {"row", "chunk"}:
-            raise ValueError(f"Invalid PianoCoRe sample_unit={sample_unit}. Must be 'row' or 'chunk'.")
+        if sample_unit not in {"row", "chunk", "valid_chunk_start"}:
+            raise ValueError(
+                f"Invalid PianoCoRe sample_unit={sample_unit}. "
+                "Must be 'row', 'chunk', or 'valid_chunk_start'."
+            )
         self.manifest_path = str(manifest_path)
         self.pianocore_root = str(Path(pianocore_root).resolve())
         self.split = split
@@ -498,6 +502,9 @@ class PianoCoReDataset(Dataset):
         self.fail_log_flush = bool(fail_log_flush)
         self.respect_alignment_segments = bool(respect_alignment_segments)
         self.sample_unit = sample_unit
+        self.min_valid_start_len = int(min_valid_start_len)
+        if self.sample_unit == "valid_chunk_start" and self.min_valid_start_len <= 0:
+            raise ValueError("--pianocore_min_valid_start_len must be positive for valid_chunk_start sampling")
 
         self.metadata = self._load_manifest(self.manifest_path, split, split_col)
         if len(self.metadata) == 0:
@@ -552,11 +559,42 @@ class PianoCoReDataset(Dataset):
             return len(self.sample_index)
         return len(self.metadata)
 
+    def _start_effective_len(
+        self,
+        chunk_annots: Dict[str, list],
+        start_chunk: int,
+    ) -> int:
+        n_chunks = min(len(chunk_annots["midi"]), len(chunk_annots["mxl"]))
+        segment_ids = self._alignment_segment_ids(chunk_annots)
+        active_segment_id = None
+        if self.respect_alignment_segments and segment_ids is not None:
+            active_segment_id = segment_ids[start_chunk]
+
+        seq_length = self.seq_length
+        total = 0
+        for chunk_i, (midi_chunk, mxl_chunk) in enumerate(
+            zip(chunk_annots["midi"][start_chunk:n_chunks], chunk_annots["mxl"][start_chunk:n_chunks]),
+            start=start_chunk,
+        ):
+            if active_segment_id is not None and segment_ids[chunk_i] != active_segment_id:
+                break
+            length = max(len(midi_chunk), len(mxl_chunk))
+            if length == 0:
+                continue
+            if seq_length is not None and total > 0 and total + length > seq_length:
+                break
+            total += length
+            if seq_length is not None and total >= seq_length:
+                return int(seq_length)
+        return int(total)
+
     def _build_sample_index(self) -> Optional[list[dict[str, int]]]:
         if self.sample_unit == "row":
             return None
 
         sample_index: list[dict[str, int]] = []
+        n_candidate_starts = 0
+        n_dropped_short_starts = 0
         for row_idx, sample in self.metadata.iterrows():
             row_id = str(sample.get("id", row_idx))
             try:
@@ -566,7 +604,17 @@ class PianoCoReDataset(Dataset):
                 for chunk_idx in range(n_chunks):
                     if len(chunk_annots["midi"][chunk_idx]) == 0 or len(chunk_annots["mxl"][chunk_idx]) == 0:
                         continue
-                    sample_index.append({"row_idx": int(row_idx), "chunk_idx": int(chunk_idx)})
+                    n_candidate_starts += 1
+                    effective_len = None
+                    if self.sample_unit == "valid_chunk_start":
+                        effective_len = self._start_effective_len(chunk_annots, chunk_idx)
+                        if effective_len < self.min_valid_start_len:
+                            n_dropped_short_starts += 1
+                            continue
+                    entry = {"row_idx": int(row_idx), "chunk_idx": int(chunk_idx)}
+                    if effective_len is not None:
+                        entry["effective_len"] = int(effective_len)
+                    sample_index.append(entry)
             except Exception as e:
                 if not self.skip_on_error:
                     raise
@@ -574,6 +622,8 @@ class PianoCoReDataset(Dataset):
 
         if len(sample_index) == 0:
             raise ValueError(f"PianoCoReDataset sample_unit={self.sample_unit} produced no sample units")
+        self.n_candidate_starts = int(n_candidate_starts)
+        self.n_dropped_short_starts = int(n_dropped_short_starts)
         return sample_index
 
     def _row_and_start_chunk(self, idx: int) -> tuple[int, Optional[int]]:

@@ -432,8 +432,17 @@ def main():
         "--pianocore_sample_unit",
         type=str,
         default="row",
-        choices=["row", "chunk"],
-        help="Sample PianoCoRe by manifest row or by chunk/window entry in the chunk json.",
+        choices=["row", "chunk", "valid_chunk_start"],
+        help=(
+            "Sample PianoCoRe by manifest row, by every chunk entry, or only by chunk starts "
+            "that can concatenate to --pianocore_min_valid_start_len within one alignment segment."
+        ),
+    )
+    parser.add_argument(
+        "--pianocore_min_valid_start_len",
+        type=int,
+        default=384,
+        help="Minimum effective unpadded length for --pianocore_sample_unit valid_chunk_start.",
     )
 
     # training schedule
@@ -529,11 +538,22 @@ def main():
             skip_on_error=True,
             respect_alignment_segments=(not args.pianocore_ignore_alignment_segments),
             sample_unit=args.pianocore_sample_unit,
+            min_valid_start_len=args.pianocore_min_valid_start_len,
         )
         print(
             f"PianoCoRe paired train rows: {len(pianocore_set.metadata)}; "
             f"sample units ({args.pianocore_sample_unit}): {len(pianocore_set)}"
         )
+        if args.pianocore_sample_unit == "valid_chunk_start":
+            n_candidates = getattr(pianocore_set, "n_candidate_starts", 0)
+            n_dropped = getattr(pianocore_set, "n_dropped_short_starts", 0)
+            keep_ratio = len(pianocore_set) / max(n_candidates, 1)
+            print(
+                "PianoCoRe valid chunk starts: "
+                f"kept={len(pianocore_set)} / candidates={n_candidates} "
+                f"({keep_ratio:.2%}); dropped_short={n_dropped}; "
+                f"min_valid_start_len={args.pianocore_min_valid_start_len}"
+            )
         pianocore_loader = DataLoader(
             pianocore_set,
             batch_size=args.batch_size,
