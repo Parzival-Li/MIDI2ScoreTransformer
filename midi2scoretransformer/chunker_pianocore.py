@@ -543,6 +543,177 @@ def make_score_time_chunks(
     }
 
 
+def make_score_time_padding_chunks(
+    n_xml: int,
+    n_perf: int,
+    pairs: np.ndarray,
+    score_onsets: np.ndarray,
+    beat_quarter_len: float = 1.0,
+    beats_per_chunk: int = 1,
+    min_mxl_notes: int = 1,
+    min_midi_notes: int = 1,
+    min_matched_score_ratio: float = 0.50,
+    min_matched_perf_ratio: float = 0.30,
+    context_perf_notes: int = 0,
+    max_midi_mxl_ratio: float = 4.0,
+    max_midi_notes_per_chunk: int = 128,
+    min_monotonic_ratio: float = 0.01,
+) -> Dict[str, Any]:
+    """
+    Generate score-time chunks while preserving rejected score-time bins as
+    padding-only spans. Good chunks train normally; bad chunks have empty
+    midi/mxl lists plus chunk_is_trainable=false and chunk_pad_len>0.
+    """
+    if n_xml <= 0 or n_perf <= 0:
+        return {"midi": [], "mxl": [], "swapped": False, "source": "pianocore_raw_alignment"}
+    if len(score_onsets) != n_xml:
+        raise ValueError(f"score_onsets len={len(score_onsets)} does not match n_xml={n_xml}")
+    if beat_quarter_len <= 0:
+        raise ValueError("--beat-quarter-len must be positive")
+    if beats_per_chunk <= 0:
+        raise ValueError("--beats-per-chunk must be positive")
+
+    pairs = pairs.astype(np.int64, copy=False)
+    matched = pairs[(pairs[:, 0] >= 0) & (pairs[:, 1] >= 0)]
+
+    score_to_perf: dict[int, list[int]] = {}
+    perf_to_score: dict[int, list[int]] = {}
+    for s, p in matched:
+        if 0 <= s < n_xml and 0 <= p < n_perf:
+            score_to_perf.setdefault(int(s), []).append(int(p))
+            perf_to_score.setdefault(int(p), []).append(int(s))
+
+    width = float(beat_quarter_len) * int(beats_per_chunk)
+    finite_onsets = score_onsets[np.isfinite(score_onsets)]
+    if len(finite_onsets) == 0:
+        raise ValueError("No finite score onset values")
+
+    start_bin = int(np.floor(float(finite_onsets.min()) / width))
+    end_bin = int(np.floor(float(finite_onsets.max()) / width))
+
+    midi_chunks: list[list[int]] = []
+    mxl_chunks: list[list[int]] = []
+    chunk_is_trainable: list[bool] = []
+    chunk_pad_len: list[int] = []
+    stats: list[dict[str, Any]] = []
+    rejection_counts: dict[str, int] = {}
+
+    def reject(reason: str):
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    for b in range(start_bin, end_bin + 1):
+        t0 = b * width
+        t1 = t0 + width
+        if b == end_bin:
+            mxl_idx = np.where((score_onsets >= t0) & (score_onsets <= t1))[0]
+        else:
+            mxl_idx = np.where((score_onsets >= t0) & (score_onsets < t1))[0]
+        mxl_chunk = [int(i) for i in mxl_idx if 0 <= int(i) < n_xml]
+        if len(mxl_chunk) == 0:
+            continue
+
+        reason = "ok"
+        perf_matched = sorted({p for s in mxl_chunk for p in score_to_perf.get(s, [])})
+        midi_chunk: list[int] = []
+        matched_score_ratio = 0.0
+        matched_perf_ratio = 0.0
+        monotonic_ratio = 1.0
+
+        if len(mxl_chunk) < min_mxl_notes:
+            reason = "min_mxl_notes"
+        elif not perf_matched:
+            reason = "no_matched_perf"
+        else:
+            p0 = max(min(perf_matched) - context_perf_notes, 0)
+            p1 = min(max(perf_matched) + context_perf_notes + 1, n_perf)
+            midi_chunk = list(range(p0, p1))
+            if len(midi_chunk) < min_midi_notes:
+                reason = "min_midi_notes"
+            elif max_midi_notes_per_chunk > 0 and len(midi_chunk) > max_midi_notes_per_chunk:
+                reason = "max_midi_notes_per_chunk"
+            elif max_midi_mxl_ratio > 0 and len(midi_chunk) / max(len(mxl_chunk), 1) > max_midi_mxl_ratio:
+                reason = "max_midi_mxl_ratio"
+            else:
+                matched_score_ratio = len([s for s in mxl_chunk if s in score_to_perf]) / max(len(mxl_chunk), 1)
+                matched_perf_in_chunk = [p for p in midi_chunk if any(s in mxl_chunk for s in perf_to_score.get(p, []))]
+                matched_perf_ratio = len(matched_perf_in_chunk) / max(len(midi_chunk), 1)
+
+                perf_for_score = []
+                for s in mxl_chunk:
+                    ps = score_to_perf.get(s, [])
+                    if ps:
+                        perf_for_score.append(min(ps))
+                if len(perf_for_score) > 1:
+                    monotonic_ratio = float(np.mean(np.diff(np.asarray(perf_for_score)) >= 0))
+
+                if matched_score_ratio < min_matched_score_ratio:
+                    reason = "min_matched_score_ratio"
+                elif matched_perf_ratio < min_matched_perf_ratio:
+                    reason = "min_matched_perf_ratio"
+                elif monotonic_ratio < min_monotonic_ratio:
+                    reason = "min_monotonic_ratio"
+
+        is_trainable = reason == "ok"
+        if not is_trainable:
+            reject(reason)
+            pad_len = max(len(mxl_chunk), len(midi_chunk), 1)
+            midi_chunks.append([])
+            mxl_chunks.append([])
+        else:
+            pad_len = max(len(mxl_chunk), len(midi_chunk), 1)
+            midi_chunks.append(midi_chunk)
+            mxl_chunks.append(mxl_chunk)
+
+        chunk_is_trainable.append(is_trainable)
+        chunk_pad_len.append(int(pad_len))
+        stats.append({
+            "score_bin": int(b),
+            "score_time_start": float(t0),
+            "score_time_end": float(t1),
+            "midi_start": int(min(midi_chunk)) if midi_chunk else -1,
+            "midi_end": int(max(midi_chunk) + 1) if midi_chunk else -1,
+            "n_mxl": len(mxl_chunk),
+            "n_midi": len(midi_chunk),
+            "matched_score_ratio": matched_score_ratio,
+            "matched_perf_ratio": matched_perf_ratio,
+            "monotonic_ratio": monotonic_ratio,
+            "chunk_is_trainable": is_trainable,
+            "reject_reason": reason,
+            "pad_len": int(pad_len),
+        })
+
+    if not any(chunk_is_trainable):
+        return {
+            "midi": [],
+            "mxl": [],
+            "swapped": False,
+            "source": "pianocore_raw_alignment",
+            "chunk_unit": "score_time_pseudo_beat_padding",
+            "beat_quarter_len": float(beat_quarter_len),
+            "beats_per_chunk": int(beats_per_chunk),
+            "stats": stats,
+            "chunk_is_trainable": chunk_is_trainable,
+            "chunk_pad_len": chunk_pad_len,
+            "rejection_counts": rejection_counts,
+        }
+
+    return {
+        "midi": midi_chunks,
+        "mxl": mxl_chunks,
+        "swapped": False,
+        "source": "pianocore_raw_alignment",
+        "chunk_unit": "score_time_pseudo_beat_padding",
+        "beat_quarter_len": float(beat_quarter_len),
+        "beats_per_chunk": int(beats_per_chunk),
+        "stats": stats,
+        "chunk_is_trainable": chunk_is_trainable,
+        "chunk_pad_len": chunk_pad_len,
+        "rejection_counts": rejection_counts,
+        "n_bad_chunks": int(sum(not x for x in chunk_is_trainable)),
+        "n_good_chunks": int(sum(chunk_is_trainable)),
+    }
+
+
 def make_alignment_segment_chunks(
     n_xml: int,
     n_perf: int,
@@ -861,7 +1032,7 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
             n_perf = _metadata_int(row, "performance_note_count")
 
             needs_xml_onsets = (
-                args.chunk_mode in {"score_time", "alignment_segment"}
+                args.chunk_mode in {"score_time", "score_time_padding", "alignment_segment"}
                 and args.pseudo_beat_source == "xml_absolute_onset"
             )
             if needs_xml_onsets or n_xml is None:
@@ -923,6 +1094,32 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
                 raise ValueError(f"Invalid pseudo_beat_source={args.pseudo_beat_source}")
 
             chunks = make_score_time_chunks(
+                n_xml=check["n_xml"],
+                n_perf=check["n_perf"],
+                pairs=pairs,
+                score_onsets=score_onsets,
+                beat_quarter_len=args.beat_quarter_len,
+                beats_per_chunk=args.beats_per_chunk,
+                min_mxl_notes=args.min_mxl_notes,
+                min_midi_notes=args.min_midi_notes,
+                min_matched_score_ratio=args.min_matched_score_ratio,
+                min_matched_perf_ratio=args.min_matched_perf_ratio,
+                context_perf_notes=args.context_perf_notes,
+                max_midi_mxl_ratio=args.max_midi_mxl_ratio,
+                max_midi_notes_per_chunk=args.max_midi_notes_per_chunk,
+                min_monotonic_ratio=args.min_monotonic_ratio,
+            )
+        elif args.chunk_mode == "score_time_padding":
+            if args.pseudo_beat_source == "xml_absolute_onset":
+                if score_xml is None:
+                    score_xml = MultistreamTokenizer.parse_mxl(score_xml_path)
+                score_onsets = _score_onsets_from_xml(score_xml)
+            elif args.pseudo_beat_source == "npz_score_times":
+                score_onsets = _score_onsets_from_npz(npz, check["n_xml"])
+            else:
+                raise ValueError(f"Invalid pseudo_beat_source={args.pseudo_beat_source}")
+
+            chunks = make_score_time_padding_chunks(
                 n_xml=check["n_xml"],
                 n_perf=check["n_perf"],
                 pairs=pairs,
@@ -1031,12 +1228,13 @@ def main():
     )
     ap.add_argument(
         "--chunk-mode",
-        choices=["note_count", "score_time", "alignment_segment"],
+        choices=["note_count", "score_time", "score_time_padding", "alignment_segment"],
         default="note_count",
         help=(
             "note_count keeps the old 512-target-note chunks; score_time builds pseudo-beat chunks "
-            "from score onsets; alignment_segment builds pseudo-beat chunks and assigns continuous "
-            "segment ids so training cannot concatenate across rejected local regions."
+            "from score onsets; score_time_padding keeps rejected non-empty bins as padding-only "
+            "chunks; alignment_segment builds pseudo-beat chunks and assigns continuous segment ids "
+            "so training cannot concatenate across rejected local regions."
         ),
     )
     ap.add_argument("--note-chunk-size", type=int, default=512)
@@ -1123,7 +1321,7 @@ def main():
     if args.min_mxl_notes <= 0:
         if args.chunk_mode == "note_count":
             args.min_mxl_notes = 16
-        elif args.chunk_mode in {"score_time", "alignment_segment"}:
+        elif args.chunk_mode in {"score_time", "score_time_padding", "alignment_segment"}:
             args.min_mxl_notes = 1
         else:
             args.min_mxl_notes = 64
@@ -1141,7 +1339,7 @@ def main():
     if args.min_monotonic_ratio <= 0:
         if args.chunk_mode == "note_count":
             args.min_monotonic_ratio = 0.0
-        elif args.chunk_mode == "score_time":
+        elif args.chunk_mode in {"score_time", "score_time_padding"}:
             args.min_monotonic_ratio = 0.95
         else:
             # Pseudo-beat chunks are tiny, so strict local monotonicity splits
