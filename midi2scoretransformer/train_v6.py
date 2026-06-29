@@ -444,6 +444,28 @@ def main():
         default=384,
         help="Minimum effective unpadded length for --pianocore_sample_unit valid_chunk_start.",
     )
+    parser.add_argument(
+        "--pianocore_max_per_score",
+        type=int,
+        default=0,
+        help="If >0, keep at most this many PianoCoRe p-MIDI rows under each score_xml_path.",
+    )
+    parser.add_argument(
+        "--pianocore_score_balanced_sampling",
+        action="store_true",
+        help="Sample PianoCoRe by score_xml_path first, then choose a p-MIDI row/start within that score.",
+    )
+    parser.add_argument(
+        "--pianocore_score_key_col",
+        type=str,
+        default="score_xml_path",
+        help="Manifest column used as PianoCoRe score-level grouping key.",
+    )
+    parser.add_argument(
+        "--pianocore_pad_bad_chunks",
+        action="store_true",
+        help="Treat chunk json entries with chunk_is_trainable=false as padding spans with no loss.",
+    )
 
     # training schedule
     parser.add_argument("--max_steps", type=int, default=40000)
@@ -539,11 +561,23 @@ def main():
             respect_alignment_segments=(not args.pianocore_ignore_alignment_segments),
             sample_unit=args.pianocore_sample_unit,
             min_valid_start_len=args.pianocore_min_valid_start_len,
+            max_per_score=args.pianocore_max_per_score,
+            score_balanced_sampling=args.pianocore_score_balanced_sampling,
+            score_key_col=args.pianocore_score_key_col,
+            pad_bad_chunks=args.pianocore_pad_bad_chunks,
         )
         print(
             f"PianoCoRe paired train rows: {len(pianocore_set.metadata)}; "
             f"sample units ({args.pianocore_sample_unit}): {len(pianocore_set)}"
         )
+        if args.pianocore_max_per_score > 0 or args.pianocore_score_balanced_sampling:
+            print(
+                "PianoCoRe score controls: "
+                f"max_per_score={args.pianocore_max_per_score}; "
+                f"score_balanced_sampling={args.pianocore_score_balanced_sampling}; "
+                f"score_key_col={args.pianocore_score_key_col}; "
+                f"score_groups={len(getattr(pianocore_set, 'score_groups', []))}"
+            )
         if args.pianocore_sample_unit == "valid_chunk_start":
             n_candidates = getattr(pianocore_set, "n_candidate_starts", 0)
             n_dropped = getattr(pianocore_set, "n_dropped_short_starts", 0)

@@ -477,6 +477,10 @@ class PianoCoReDataset(Dataset):
         respect_alignment_segments: bool = True,
         sample_unit: str = "row",
         min_valid_start_len: int = 384,
+        max_per_score: int = 0,
+        score_balanced_sampling: bool = False,
+        score_key_col: str = "score_xml_path",
+        pad_bad_chunks: bool = False,
     ):
         super().__init__()
         assert padding in ("per-beat", "end", None)
@@ -503,6 +507,10 @@ class PianoCoReDataset(Dataset):
         self.respect_alignment_segments = bool(respect_alignment_segments)
         self.sample_unit = sample_unit
         self.min_valid_start_len = int(min_valid_start_len)
+        self.max_per_score = int(max_per_score)
+        self.score_balanced_sampling = bool(score_balanced_sampling)
+        self.score_key_col = str(score_key_col)
+        self.pad_bad_chunks = bool(pad_bad_chunks)
         if self.sample_unit == "valid_chunk_start" and self.min_valid_start_len <= 0:
             raise ValueError("--pianocore_min_valid_start_len must be positive for valid_chunk_start sampling")
 
@@ -521,6 +529,8 @@ class PianoCoReDataset(Dataset):
         self.fail_log_path = fail_log_path
         os.makedirs(os.path.dirname(os.path.abspath(self.fail_log_path)), exist_ok=True)
         self.sample_index = self._build_sample_index()
+        self.row_to_sample_entries = self._build_row_to_sample_entries()
+        self.score_groups = self._build_score_groups()
 
     def _load_manifest(self, manifest_path: str, split: str, split_col: str) -> pd.DataFrame:
         df = pd.read_csv(manifest_path, low_memory=False)
@@ -550,11 +560,20 @@ class PianoCoReDataset(Dataset):
             df = df[exists]
         if self.max_rows and self.max_rows > 0:
             df = df.head(self.max_rows).copy()
+        if self.max_per_score and self.max_per_score > 0:
+            key_col = self.score_key_col if self.score_key_col in df.columns else "score_xml_path"
+            df = (
+                df.sort_values([key_col, "id"] if "id" in df.columns else [key_col])
+                .groupby(key_col, sort=False, group_keys=False)
+                .head(self.max_per_score)
+            )
 
         df = df.reset_index(drop=True)
         return df
 
     def __len__(self) -> int:
+        if self.score_balanced_sampling:
+            return len(self.score_groups)
         if self.sample_index is not None:
             return len(self.sample_index)
         return len(self.metadata)
@@ -604,6 +623,8 @@ class PianoCoReDataset(Dataset):
                 for chunk_idx in range(n_chunks):
                     if len(chunk_annots["midi"][chunk_idx]) == 0 or len(chunk_annots["mxl"][chunk_idx]) == 0:
                         continue
+                    if self.pad_bad_chunks and not self._chunk_is_trainable(chunk_annots, chunk_idx):
+                        continue
                     n_candidate_starts += 1
                     effective_len = None
                     if self.sample_unit == "valid_chunk_start":
@@ -626,7 +647,44 @@ class PianoCoReDataset(Dataset):
         self.n_dropped_short_starts = int(n_dropped_short_starts)
         return sample_index
 
+    def _build_row_to_sample_entries(self) -> dict[int, list[dict[str, int]]]:
+        if self.sample_index is None:
+            return {}
+        out: dict[int, list[dict[str, int]]] = {}
+        for entry in self.sample_index:
+            out.setdefault(int(entry["row_idx"]), []).append(entry)
+        return out
+
+    def _build_score_groups(self) -> list[list[int]]:
+        if not self.score_balanced_sampling:
+            return []
+        key_col = self.score_key_col if self.score_key_col in self.metadata.columns else "score_xml_path"
+        row_pool: Optional[set[int]] = None
+        if self.sample_index is not None:
+            row_pool = set(self.row_to_sample_entries.keys())
+
+        groups: list[list[int]] = []
+        for _, group in self.metadata.groupby(key_col, sort=False):
+            rows = [int(i) for i in group.index]
+            if row_pool is not None:
+                rows = [i for i in rows if i in row_pool]
+            if rows:
+                groups.append(rows)
+        if not groups:
+            raise ValueError("PianoCoRe score-balanced sampling produced no score groups")
+        return groups
+
     def _row_and_start_chunk(self, idx: int) -> tuple[int, Optional[int]]:
+        if self.score_balanced_sampling:
+            rows = self.score_groups[int(idx) % len(self.score_groups)]
+            if self.sample_index is None:
+                return int(random.choice(rows)), None
+            row_idx = int(random.choice(rows))
+            starts = self.row_to_sample_entries.get(row_idx, [])
+            if not starts:
+                return row_idx, None
+            entry = random.choice(starts)
+            return int(entry["row_idx"]), int(entry["chunk_idx"])
         if self.sample_index is None:
             return int(idx), None
         entry = self.sample_index[int(idx)]
@@ -702,12 +760,20 @@ class PianoCoReDataset(Dataset):
         n_chunks = len(chunk_annots["midi"])
         if n_chunks <= 1:
             return 0
+        choices_all = [
+            i for i in range(n_chunks)
+            if (not self.pad_bad_chunks) or self._chunk_is_trainable(chunk_annots, i)
+        ]
+        if not choices_all:
+            choices_all = list(range(n_chunks))
         if v is True:
-            return random.randint(0, n_chunks - 1)
+            return random.choice(choices_all)
         if isinstance(v, int):
             avg = sum(len(x) for x in chunk_annots["midi"]) / max(n_chunks, 1)
             step = max(1, int(v / max(avg, 1)))
-            choices = list(range(0, n_chunks, step))
+            choices = [i for i in range(0, n_chunks, step) if i in set(choices_all)]
+            if not choices:
+                choices = choices_all
             return random.choice(choices)
         raise ValueError("Invalid random_crop value")
 
@@ -724,6 +790,28 @@ class PianoCoReDataset(Dataset):
         return segment_ids
 
     @staticmethod
+    def _chunk_is_trainable(chunk_annots: Dict[str, list], chunk_i: int) -> bool:
+        flags = chunk_annots.get("chunk_is_trainable")
+        if flags is None:
+            flags = chunk_annots.get("chunk_trainable")
+        if flags is None:
+            return True
+        if chunk_i >= len(flags):
+            raise ValueError(
+                f"Invalid chunk_is_trainable length={len(flags)} for chunk_i={chunk_i}"
+            )
+        return bool(flags[chunk_i])
+
+    @staticmethod
+    def _chunk_pad_len(chunk_annots: Dict[str, list], chunk_i: int, default_length: int) -> int:
+        lengths = chunk_annots.get("chunk_pad_len")
+        if lengths is None:
+            lengths = chunk_annots.get("pad_len")
+        if lengths is None or chunk_i >= len(lengths):
+            return max(int(default_length), 1)
+        return max(int(lengths[chunk_i]), 1)
+
+    @staticmethod
     def _process_chunk(stream: Dict[str, torch.Tensor], chunk: list, padding, length: int):
         if len(chunk) == 0:
             # Empty side in a paired chunk is not useful for this model.
@@ -732,6 +820,13 @@ class PianoCoReDataset(Dataset):
         if padding == "per-beat":
             return {k: cut_pad(v[idx], length, 0) for k, v in stream.items()}
         return {k: v[idx] for k, v in stream.items()}
+
+    @staticmethod
+    def _process_padding_chunk(stream: Dict[str, torch.Tensor], length: int):
+        return {
+            k: torch.zeros((length, *v.shape[1:]), dtype=v.dtype, device=v.device)
+            for k, v in stream.items()
+        }
 
     def _get_one(self, idx: int):
         row_idx, fixed_start_chunk = self._row_and_start_chunk(idx)
@@ -806,13 +901,20 @@ class PianoCoReDataset(Dataset):
         ):
             if active_segment_id is not None and segment_ids[chunk_i] != active_segment_id:
                 break
+            is_trainable = (not self.pad_bad_chunks) or self._chunk_is_trainable(chunk_annots, chunk_i)
             length = max(len(midi_chunk), len(mxl_chunk))
+            if not is_trainable:
+                length = self._chunk_pad_len(chunk_annots, chunk_i, length)
             if length == 0:
                 continue
             if new_input_stream is not None and len(new_input_stream["onset"]) + length > seq_length + extra_shift:
                 break
-            in_chunk = self._process_chunk(input_stream, midi_chunk, self.padding, length)
-            out_chunk = self._process_chunk(output_stream, mxl_chunk, self.padding, length)
+            if is_trainable:
+                in_chunk = self._process_chunk(input_stream, midi_chunk, self.padding, length)
+                out_chunk = self._process_chunk(output_stream, mxl_chunk, self.padding, length)
+            else:
+                in_chunk = self._process_padding_chunk(input_stream, length)
+                out_chunk = self._process_padding_chunk(output_stream, length)
             if new_input_stream is None:
                 new_input_stream = in_chunk
                 new_output_stream = out_chunk
