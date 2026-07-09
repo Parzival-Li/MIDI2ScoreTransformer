@@ -76,11 +76,72 @@ def _first_failure(metrics: Dict[str, Any], args) -> str:
     return "ok"
 
 
+def _monotonic_ratio(values: list[int]) -> float:
+    if len(values) <= 1:
+        return 1.0
+    return float(np.mean(np.diff(np.asarray(values)) >= 0))
+
+
+def _chord_aware_monotonic_ratio(
+    mxl_chunk: list[int],
+    score_to_perf: dict[int, list[int]],
+    score_onsets: Optional[np.ndarray],
+    onset_eps: float,
+) -> tuple[float, int, int]:
+    """Ignore ordering differences inside notes that share one score onset."""
+    if score_onsets is None:
+        return 1.0, 0, 0
+
+    intervals: list[tuple[int, int]] = []
+    current_onset: Optional[float] = None
+    current_perf: list[int] = []
+    chord_group_count = 0
+    chord_note_count = 0
+
+    def flush_group() -> None:
+        nonlocal current_onset, current_perf, chord_group_count, chord_note_count
+        if not current_perf:
+            current_onset = None
+            return
+        intervals.append((min(current_perf), max(current_perf)))
+        if len(current_perf) > 1:
+            chord_group_count += 1
+            chord_note_count += len(current_perf)
+        current_onset = None
+        current_perf = []
+
+    for s in mxl_chunk:
+        ps = score_to_perf.get(s, [])
+        if not ps:
+            continue
+        if s < 0 or s >= len(score_onsets) or not np.isfinite(score_onsets[s]):
+            flush_group()
+            intervals.append((min(ps), max(ps)))
+            continue
+
+        onset = float(score_onsets[s])
+        if current_onset is not None and abs(onset - current_onset) <= onset_eps:
+            current_perf.extend(int(p) for p in ps)
+        else:
+            flush_group()
+            current_onset = onset
+            current_perf = [int(p) for p in ps]
+    flush_group()
+
+    if len(intervals) <= 1:
+        return 1.0, chord_group_count, chord_note_count
+    ok = [intervals[i][0] >= intervals[i - 1][1] for i in range(1, len(intervals))]
+    return float(np.mean(ok)), chord_group_count, chord_note_count
+
+
 def _bucket_metrics(
     mxl_chunk: list[int],
     midi_chunk: list[int],
     score_to_perf: dict[int, list[int]],
     perf_to_score: dict[int, list[int]],
+    score_onsets: Optional[np.ndarray] = None,
+    chord_aware_monotonic: bool = False,
+    chord_onset_eps: float = 1e-6,
 ) -> Dict[str, Any]:
     mxl_set = set(mxl_chunk)
     matched_score = [s for s in mxl_chunk if s in score_to_perf]
@@ -93,10 +154,17 @@ def _bucket_metrics(
         ps = score_to_perf.get(s, [])
         if ps:
             perf_for_score.append(min(ps))
-    if len(perf_for_score) <= 1:
-        monotonic_ratio = 1.0
-    else:
-        monotonic_ratio = float(np.mean(np.diff(np.asarray(perf_for_score)) >= 0))
+    raw_monotonic_ratio = _monotonic_ratio(perf_for_score)
+
+    chord_aware_ratio = raw_monotonic_ratio
+    chord_group_count = 0
+    chord_note_count = 0
+    if chord_aware_monotonic and score_onsets is not None:
+        chord_aware_ratio, chord_group_count, chord_note_count = _chord_aware_monotonic_ratio(
+            mxl_chunk, score_to_perf, score_onsets, chord_onset_eps
+        )
+
+    monotonic_ratio = chord_aware_ratio if chord_aware_monotonic else raw_monotonic_ratio
 
     return {
         "n_mxl": len(mxl_chunk),
@@ -106,6 +174,10 @@ def _bucket_metrics(
         "matched_perf_ratio": _safe_div(len(matched_perf_in_chunk), len(midi_chunk)),
         "midi_mxl_ratio": _safe_div(len(midi_chunk), max(len(mxl_chunk), 1)),
         "monotonic_ratio": monotonic_ratio,
+        "raw_monotonic_ratio": raw_monotonic_ratio,
+        "chord_aware_monotonic_ratio": chord_aware_ratio,
+        "chord_group_count": chord_group_count,
+        "chord_note_count": chord_note_count,
         "matched_perf_in_chunk": matched_perf_in_chunk,
     }
 
@@ -129,7 +201,10 @@ def analyze_repair_for_piece(
 
     summary = Counter()
     reason_counts = Counter()
+    post_chord_reason_counts = Counter()
     rescued_reason_counts = Counter()
+    chord_rescued_reason_counts = Counter()
+    extra_rescued_reason_counts = Counter()
     candidate_reason_counts = Counter()
     deleted_notes_rescued = 0
     deleted_notes_candidates = 0
@@ -173,11 +248,58 @@ def analyze_repair_for_piece(
         summary["original_bad_bins"] += 1
         if original_reason in repair_relevant_reasons:
             summary["repair_relevant_bad_bins"] += 1
+
+        active_metrics = original_metrics
+        active_reason = original_reason
+        post_chord_reason = original_reason
+        if args.chord_aware_monotonic:
+            summary["chord_checked_bad_bins"] += 1
+            chord_metrics = _bucket_metrics(
+                mxl_chunk,
+                midi_chunk,
+                score_to_perf,
+                perf_to_score,
+                score_onsets=score_onsets,
+                chord_aware_monotonic=True,
+                chord_onset_eps=args.chord_onset_eps,
+            )
+            post_chord_reason = _first_failure(chord_metrics, args)
+            post_chord_reason_counts[post_chord_reason] += 1
+            if post_chord_reason == "ok":
+                summary["chord_rescued_bins"] += 1
+                summary["rescued_bins"] += 1
+                rescued_reason_counts[original_reason] += 1
+                chord_rescued_reason_counts[original_reason] += 1
+                if args.write_bin_details:
+                    detail_rows.append({
+                        "score_bin": int(b),
+                        "score_time_start": float(t0),
+                        "score_time_end": float(t1),
+                        "original_reason": original_reason,
+                        "post_chord_reason": post_chord_reason,
+                        "repaired_reason": post_chord_reason,
+                        "repair_attempted": True,
+                        "repair_type": "chord_monotonic",
+                        "repairable": True,
+                        "deleted_notes": 0,
+                        "original_n_mxl": len(mxl_chunk),
+                        "original_n_midi": len(midi_chunk),
+                        "raw_monotonic_ratio": original_metrics["raw_monotonic_ratio"],
+                        "chord_aware_monotonic_ratio": chord_metrics["chord_aware_monotonic_ratio"],
+                        "chord_group_count": chord_metrics["chord_group_count"],
+                        "chord_note_count": chord_metrics["chord_note_count"],
+                    })
+                continue
+            summary["post_chord_bad_bins"] += 1
+            active_metrics = chord_metrics
+            active_reason = post_chord_reason
+
         if not midi_chunk:
             if args.write_bin_details:
                 detail_rows.append({
                     "score_bin": int(b),
                     "original_reason": original_reason,
+                    "post_chord_reason": post_chord_reason,
                     "repair_attempted": False,
                     "repairable": False,
                     "deleted_notes": 0,
@@ -185,7 +307,7 @@ def analyze_repair_for_piece(
                 })
             continue
 
-        matched_perf = sorted(set(original_metrics["matched_perf_in_chunk"]))
+        matched_perf = sorted(set(active_metrics["matched_perf_in_chunk"]))
         deleted_notes = len(midi_chunk) - len(matched_perf)
         repair_attempted = deleted_notes > 0
         if not repair_attempted:
@@ -193,6 +315,7 @@ def analyze_repair_for_piece(
                 detail_rows.append({
                     "score_bin": int(b),
                     "original_reason": original_reason,
+                    "post_chord_reason": post_chord_reason,
                     "repair_attempted": False,
                     "repairable": False,
                     "deleted_notes": 0,
@@ -202,20 +325,30 @@ def analyze_repair_for_piece(
             continue
 
         summary["repair_candidate_bins"] += 1
-        if original_reason in repair_relevant_reasons:
+        if active_reason in repair_relevant_reasons:
             summary["repair_relevant_candidate_bins"] += 1
-        candidate_reason_counts[original_reason] += 1
+        candidate_reason_counts[active_reason] += 1
         deleted_notes_candidates += deleted_notes
 
         repaired_midi_chunk = matched_perf
-        repaired_metrics = _bucket_metrics(mxl_chunk, repaired_midi_chunk, score_to_perf, perf_to_score)
+        repaired_metrics = _bucket_metrics(
+            mxl_chunk,
+            repaired_midi_chunk,
+            score_to_perf,
+            perf_to_score,
+            score_onsets=score_onsets,
+            chord_aware_monotonic=args.chord_aware_monotonic,
+            chord_onset_eps=args.chord_onset_eps,
+        )
         repaired_reason = _first_failure(repaired_metrics, args)
         repaired_ok = repaired_reason == "ok"
         if repaired_ok:
             summary["rescued_bins"] += 1
-            if original_reason in repair_relevant_reasons:
+            summary["extra_rescued_bins"] += 1
+            if active_reason in repair_relevant_reasons:
                 summary["repair_relevant_rescued_bins"] += 1
             rescued_reason_counts[original_reason] += 1
+            extra_rescued_reason_counts[original_reason] += 1
             deleted_notes_rescued += deleted_notes
             repaired_good_notes += len(repaired_midi_chunk)
 
@@ -225,8 +358,10 @@ def analyze_repair_for_piece(
                 "score_time_start": float(t0),
                 "score_time_end": float(t1),
                 "original_reason": original_reason,
+                "post_chord_reason": post_chord_reason,
                 "repaired_reason": repaired_reason,
                 "repair_attempted": True,
+                "repair_type": "delete_extra_perf",
                 "repairable": bool(repaired_ok),
                 "deleted_notes": int(deleted_notes),
                 "delete_ratio": _safe_div(deleted_notes, len(midi_chunk)),
@@ -239,13 +374,20 @@ def analyze_repair_for_piece(
                 "original_midi_mxl_ratio": original_metrics["midi_mxl_ratio"],
                 "repaired_midi_mxl_ratio": repaired_metrics["midi_mxl_ratio"],
                 "monotonic_ratio": original_metrics["monotonic_ratio"],
+                "raw_monotonic_ratio": original_metrics["raw_monotonic_ratio"],
+                "chord_aware_monotonic_ratio": repaired_metrics["chord_aware_monotonic_ratio"],
+                "chord_group_count": repaired_metrics["chord_group_count"],
+                "chord_note_count": repaired_metrics["chord_note_count"],
             })
 
     return {
         "summary": dict(summary),
         "reason_counts": dict(reason_counts),
+        "post_chord_reason_counts": dict(post_chord_reason_counts),
         "candidate_reason_counts": dict(candidate_reason_counts),
         "rescued_reason_counts": dict(rescued_reason_counts),
+        "chord_rescued_reason_counts": dict(chord_rescued_reason_counts),
+        "extra_rescued_reason_counts": dict(extra_rescued_reason_counts),
         "deleted_notes_candidates": int(deleted_notes_candidates),
         "deleted_notes_rescued": int(deleted_notes_rescued),
         "repaired_good_notes": int(repaired_good_notes),
@@ -321,16 +463,23 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
             "original_ok_bins": summary.get("original_ok_bins", 0),
             "original_bad_bins": summary.get("original_bad_bins", 0),
             "repair_relevant_bad_bins": summary.get("repair_relevant_bad_bins", 0),
+            "chord_checked_bad_bins": summary.get("chord_checked_bad_bins", 0),
+            "chord_rescued_bins": summary.get("chord_rescued_bins", 0),
+            "post_chord_bad_bins": summary.get("post_chord_bad_bins", 0),
             "repair_candidate_bins": summary.get("repair_candidate_bins", 0),
             "repair_relevant_candidate_bins": summary.get("repair_relevant_candidate_bins", 0),
             "rescued_bins": summary.get("rescued_bins", 0),
+            "extra_rescued_bins": summary.get("extra_rescued_bins", 0),
             "repair_relevant_rescued_bins": summary.get("repair_relevant_rescued_bins", 0),
             "deleted_notes_candidates": result["deleted_notes_candidates"],
             "deleted_notes_rescued": result["deleted_notes_rescued"],
             "repaired_good_notes": result["repaired_good_notes"],
             "reason_counts": json.dumps(result["reason_counts"], sort_keys=True),
+            "post_chord_reason_counts": json.dumps(result["post_chord_reason_counts"], sort_keys=True),
             "candidate_reason_counts": json.dumps(result["candidate_reason_counts"], sort_keys=True),
             "rescued_reason_counts": json.dumps(result["rescued_reason_counts"], sort_keys=True),
+            "chord_rescued_reason_counts": json.dumps(result["chord_rescued_reason_counts"], sort_keys=True),
+            "extra_rescued_reason_counts": json.dumps(result["extra_rescued_reason_counts"], sort_keys=True),
         })
         if args.write_bin_details:
             out["_details"] = result["details"]
@@ -360,6 +509,11 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--pianocore-root", default="/mnt/ssd/hbli/datasets/pianocore/")
     ap.add_argument("--raw-alignments-zip", default="")
+    ap.add_argument(
+        "--out-dir",
+        default="",
+        help="Compatibility fallback used by identity-cache chunk path resolution.",
+    )
     ap.add_argument("--out-summary", required=True)
     ap.add_argument("--out-rows", required=True)
     ap.add_argument("--out-bin-details", default="")
@@ -379,6 +533,17 @@ def main():
     ap.add_argument("--max-midi-mxl-ratio", type=float, default=4.0)
     ap.add_argument("--max-midi-notes-per-chunk", type=int, default=128)
     ap.add_argument("--min-monotonic-ratio", type=float, default=0.01)
+    ap.add_argument(
+        "--chord-aware-monotonic",
+        action="store_true",
+        help="Treat notes with the same XML absolute_onset as one chord when checking monotonicity.",
+    )
+    ap.add_argument(
+        "--chord-onset-eps",
+        type=float,
+        default=1e-6,
+        help="Tolerance in quarterLength units for grouping XML notes into one chord onset.",
+    )
     ap.add_argument("--reuse-identity-cache", action="store_true")
     ap.add_argument("--identity-cache-manifest", default="")
     ap.add_argument("--identity-cache-chunk-suffix", default="")
@@ -442,8 +607,9 @@ def main():
     for row in ok_rows:
         for key in [
             "nonempty_score_time_bins", "original_ok_bins", "original_bad_bins",
-            "repair_relevant_bad_bins", "repair_candidate_bins",
-            "repair_relevant_candidate_bins", "rescued_bins",
+            "repair_relevant_bad_bins", "chord_checked_bad_bins",
+            "chord_rescued_bins", "post_chord_bad_bins", "repair_candidate_bins",
+            "repair_relevant_candidate_bins", "rescued_bins", "extra_rescued_bins",
             "repair_relevant_rescued_bins", "deleted_notes_candidates",
             "deleted_notes_rescued", "repaired_good_notes",
         ]:
@@ -463,21 +629,32 @@ def main():
             "repair_relevant_candidate_ratio_among_bad": _safe_div(
                 totals["repair_relevant_candidate_bins"], totals["original_bad_bins"]
             ),
+            "chord_rescued_ratio_among_bad": _safe_div(totals["chord_rescued_bins"], totals["original_bad_bins"]),
+            "post_chord_bad_ratio_among_bad": _safe_div(totals["post_chord_bad_bins"], totals["original_bad_bins"]),
             "rescued_ratio_among_bad": _safe_div(totals["rescued_bins"], totals["original_bad_bins"]),
-            "rescued_ratio_among_candidates": _safe_div(totals["rescued_bins"], totals["repair_candidate_bins"]),
+            "rescued_ratio_among_candidates": _safe_div(totals["extra_rescued_bins"], totals["repair_candidate_bins"]),
+            "extra_rescued_ratio_among_candidates": _safe_div(
+                totals["extra_rescued_bins"], totals["repair_candidate_bins"]
+            ),
+            "extra_rescued_ratio_among_post_chord_bad": _safe_div(
+                totals["extra_rescued_bins"], totals["post_chord_bad_bins"]
+            ),
             "repair_relevant_rescued_ratio_among_relevant_candidates": _safe_div(
                 totals["repair_relevant_rescued_bins"], totals["repair_relevant_candidate_bins"]
             ),
             "avg_deleted_notes_per_candidate": _safe_div(totals["deleted_notes_candidates"], totals["repair_candidate_bins"]),
-            "avg_deleted_notes_per_rescued": _safe_div(totals["deleted_notes_rescued"], totals["rescued_bins"]),
+            "avg_deleted_notes_per_rescued": _safe_div(totals["deleted_notes_rescued"], totals["extra_rescued_bins"]),
             "delete_ratio_within_rescued_repaired_chunks": _safe_div(
                 totals["deleted_notes_rescued"],
                 totals["deleted_notes_rescued"] + totals["repaired_good_notes"],
             ),
         },
         "reason_counts": dict(_sum_json_counter(ok_rows, "reason_counts")),
+        "post_chord_reason_counts": dict(_sum_json_counter(ok_rows, "post_chord_reason_counts")),
         "candidate_reason_counts": dict(_sum_json_counter(ok_rows, "candidate_reason_counts")),
         "rescued_reason_counts": dict(_sum_json_counter(ok_rows, "rescued_reason_counts")),
+        "chord_rescued_reason_counts": dict(_sum_json_counter(ok_rows, "chord_rescued_reason_counts")),
+        "extra_rescued_reason_counts": dict(_sum_json_counter(ok_rows, "extra_rescued_reason_counts")),
         "filter_params": {
             "beat_quarter_len": args.beat_quarter_len,
             "beats_per_chunk": args.beats_per_chunk,
@@ -489,6 +666,8 @@ def main():
             "max_midi_mxl_ratio": args.max_midi_mxl_ratio,
             "max_midi_notes_per_chunk": args.max_midi_notes_per_chunk,
             "min_monotonic_ratio": args.min_monotonic_ratio,
+            "chord_aware_monotonic": args.chord_aware_monotonic,
+            "chord_onset_eps": args.chord_onset_eps,
         },
     }
 
