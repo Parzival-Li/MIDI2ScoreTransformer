@@ -466,6 +466,14 @@ def main():
         action="store_true",
         help="Treat chunk json entries with chunk_is_trainable=false as padding spans with no loss.",
     )
+    parser.add_argument(
+        "--pianocore_require_chord_aware_chunks",
+        action="store_true",
+        help=(
+            "Require PianoCoRe manifest/chunk JSONs generated with "
+            "--chord-aware-monotonic; fail instead of silently using old chunks."
+        ),
+    )
 
     # training schedule
     parser.add_argument("--max_steps", type=int, default=40000)
@@ -565,6 +573,7 @@ def main():
             score_balanced_sampling=args.pianocore_score_balanced_sampling,
             score_key_col=args.pianocore_score_key_col,
             pad_bad_chunks=args.pianocore_pad_bad_chunks,
+            require_chord_aware_chunks=args.pianocore_require_chord_aware_chunks,
         )
         print(
             f"PianoCoRe paired train rows: {len(pianocore_set.metadata)}; "
@@ -578,6 +587,8 @@ def main():
                 f"score_key_col={args.pianocore_score_key_col}; "
                 f"score_groups={len(getattr(pianocore_set, 'score_groups', []))}"
             )
+        if args.pianocore_require_chord_aware_chunks:
+            print("PianoCoRe chunk monotonic mode: score_onset_group (required)")
         if args.pianocore_sample_unit == "valid_chunk_start":
             n_candidates = getattr(pianocore_set, "n_candidate_starts", 0)
             n_dropped = getattr(pianocore_set, "n_dropped_short_starts", 0)

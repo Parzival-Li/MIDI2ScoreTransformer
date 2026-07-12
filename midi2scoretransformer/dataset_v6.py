@@ -481,6 +481,7 @@ class PianoCoReDataset(Dataset):
         score_balanced_sampling: bool = False,
         score_key_col: str = "score_xml_path",
         pad_bad_chunks: bool = False,
+        require_chord_aware_chunks: bool = False,
     ):
         super().__init__()
         assert padding in ("per-beat", "end", None)
@@ -511,6 +512,7 @@ class PianoCoReDataset(Dataset):
         self.score_balanced_sampling = bool(score_balanced_sampling)
         self.score_key_col = str(score_key_col)
         self.pad_bad_chunks = bool(pad_bad_chunks)
+        self.require_chord_aware_chunks = bool(require_chord_aware_chunks)
         if self.sample_unit == "valid_chunk_start" and self.min_valid_start_len <= 0:
             raise ValueError("--pianocore_min_valid_start_len must be positive for valid_chunk_start sampling")
 
@@ -558,6 +560,19 @@ class PianoCoReDataset(Dataset):
         if self.require_chunk_file:
             exists = df["chunk_path"].map(lambda p: os.path.exists(self._resolve_path(p)))
             df = df[exists]
+        if self.require_chord_aware_chunks:
+            mode_col = "chunk_monotonic_mode"
+            if mode_col not in df.columns:
+                raise ValueError(
+                    "PianoCoRe manifest has no chunk_monotonic_mode column; "
+                    "regenerate it with chunker_pianocore.py --chord-aware-monotonic"
+                )
+            invalid = ~df[mode_col].astype(str).eq("score_onset_group")
+            if invalid.any():
+                raise ValueError(
+                    "PianoCoRe manifest contains "
+                    f"{int(invalid.sum())} non-chord-aware rows after chunk-file filtering"
+                )
         if self.max_rows and self.max_rows > 0:
             df = df.head(self.max_rows).copy()
         if self.max_per_score and self.max_per_score > 0:
@@ -752,6 +767,14 @@ class PianoCoReDataset(Dataset):
             raise ValueError(f"Invalid chunk json without midi/mxl keys: {chunk_path}")
         if len(chunk_annots["midi"]) == 0 or len(chunk_annots["mxl"]) == 0:
             raise ValueError(f"Empty chunk json: {chunk_path}")
+        if (
+            self.require_chord_aware_chunks
+            and chunk_annots.get("chunk_monotonic_mode") != "score_onset_group"
+        ):
+            raise ValueError(
+                "Expected score_onset_group chunk_monotonic_mode in "
+                f"chord-aware PianoCoRe chunk: {chunk_path}"
+            )
         return chunk_annots
 
     def _choose_start_chunk(self, chunk_annots: Dict[str, list]) -> int:

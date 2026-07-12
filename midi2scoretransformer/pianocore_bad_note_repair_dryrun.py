@@ -1,9 +1,9 @@
 """
 Dry-run analysis for conservative PianoCoRe bad-note repair.
 
-This script does not write repaired training chunks. It answers:
-  If we remove only performance notes that are unmatched/extra for a local
-  score-time bucket, how many currently rejected buckets would pass filters?
+This script does not write repaired training chunks. Its default analysis only
+re-evaluates monotonicity after grouping score notes by XML absolute_onset.
+Legacy unmatched/extra-note deletion is disabled unless explicitly requested.
 
 Run from MIDI2ScoreTransformer/midi2scoretransformer so imports resolve.
 """
@@ -294,6 +294,21 @@ def analyze_repair_for_piece(
             active_metrics = chord_metrics
             active_reason = post_chord_reason
 
+        if not args.enable_extra_deletion:
+            if args.write_bin_details:
+                detail_rows.append({
+                    "score_bin": int(b),
+                    "score_time_start": float(t0),
+                    "score_time_end": float(t1),
+                    "original_reason": original_reason,
+                    "post_chord_reason": post_chord_reason,
+                    "repair_attempted": False,
+                    "repairable": False,
+                    "deleted_notes": 0,
+                    "note": "extra-note deletion disabled",
+                })
+            continue
+
         if not midi_chunk:
             if args.write_bin_details:
                 detail_rows.append({
@@ -544,6 +559,11 @@ def main():
         default=1e-6,
         help="Tolerance in quarterLength units for grouping XML notes into one chord onset.",
     )
+    ap.add_argument(
+        "--enable-extra-deletion",
+        action="store_true",
+        help="Legacy analysis only: also try deleting unmatched/extra performance notes.",
+    )
     ap.add_argument("--reuse-identity-cache", action="store_true")
     ap.add_argument("--identity-cache-manifest", default="")
     ap.add_argument("--identity-cache-chunk-suffix", default="")
@@ -668,6 +688,7 @@ def main():
             "min_monotonic_ratio": args.min_monotonic_ratio,
             "chord_aware_monotonic": args.chord_aware_monotonic,
             "chord_onset_eps": args.chord_onset_eps,
+            "extra_deletion_enabled": args.enable_extra_deletion,
         },
     }
 

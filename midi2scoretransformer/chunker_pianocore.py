@@ -419,6 +419,72 @@ def _score_onsets_from_npz(npz: Dict[str, Any], n_xml: int) -> np.ndarray:
     return out
 
 
+def _raw_monotonic_ratio(
+    mxl_chunk: list[int],
+    score_to_perf: dict[int, list[int]],
+) -> float:
+    perf_for_score = [
+        min(score_to_perf[s])
+        for s in mxl_chunk
+        if score_to_perf.get(s)
+    ]
+    if len(perf_for_score) <= 1:
+        return 1.0
+    return float(np.mean(np.diff(np.asarray(perf_for_score)) >= 0))
+
+
+def _chord_aware_monotonic_ratio(
+    mxl_chunk: list[int],
+    score_to_perf: dict[int, list[int]],
+    score_onsets: np.ndarray,
+    onset_eps: float,
+) -> tuple[float, int, int]:
+    """Compare aligned performance order only between distinct score onsets."""
+    intervals: list[tuple[int, int]] = []
+    current_onset: Optional[float] = None
+    current_perf: list[int] = []
+    multi_note_group_count = 0
+    grouped_note_count = 0
+
+    def flush_group() -> None:
+        nonlocal current_onset, current_perf
+        nonlocal multi_note_group_count, grouped_note_count
+        if not current_perf:
+            current_onset = None
+            return
+        intervals.append((min(current_perf), max(current_perf)))
+        if len(current_perf) > 1:
+            multi_note_group_count += 1
+            grouped_note_count += len(current_perf)
+        current_onset = None
+        current_perf = []
+
+    for score_idx in mxl_chunk:
+        perf_indices = score_to_perf.get(score_idx, [])
+        if not perf_indices:
+            continue
+        onset = float(score_onsets[score_idx])
+        if not np.isfinite(onset):
+            flush_group()
+            intervals.append((min(perf_indices), max(perf_indices)))
+            continue
+        if current_onset is not None and abs(onset - current_onset) <= onset_eps:
+            current_perf.extend(int(p) for p in perf_indices)
+        else:
+            flush_group()
+            current_onset = onset
+            current_perf = [int(p) for p in perf_indices]
+    flush_group()
+
+    if len(intervals) <= 1:
+        return 1.0, multi_note_group_count, grouped_note_count
+    transitions = [
+        intervals[i][0] >= intervals[i - 1][1]
+        for i in range(1, len(intervals))
+    ]
+    return float(np.mean(transitions)), multi_note_group_count, grouped_note_count
+
+
 def make_score_time_chunks(
     n_xml: int,
     n_perf: int,
@@ -558,6 +624,8 @@ def make_score_time_padding_chunks(
     max_midi_mxl_ratio: float = 4.0,
     max_midi_notes_per_chunk: int = 128,
     min_monotonic_ratio: float = 0.01,
+    chord_aware_monotonic: bool = False,
+    chord_onset_eps: float = 1e-6,
 ) -> Dict[str, Any]:
     """
     Generate score-time chunks while preserving rejected score-time bins as
@@ -572,6 +640,8 @@ def make_score_time_padding_chunks(
         raise ValueError("--beat-quarter-len must be positive")
     if beats_per_chunk <= 0:
         raise ValueError("--beats-per-chunk must be positive")
+    if chord_onset_eps < 0:
+        raise ValueError("--chord-onset-eps must be non-negative")
 
     pairs = pairs.astype(np.int64, copy=False)
     matched = pairs[(pairs[:, 0] >= 0) & (pairs[:, 1] >= 0)]
@@ -618,6 +688,10 @@ def make_score_time_padding_chunks(
         matched_score_ratio = 0.0
         matched_perf_ratio = 0.0
         monotonic_ratio = 1.0
+        raw_monotonic_ratio = 1.0
+        chord_aware_monotonic_ratio = 1.0
+        chord_group_count = 0
+        chord_note_count = 0
 
         if len(mxl_chunk) < min_mxl_notes:
             reason = "min_mxl_notes"
@@ -638,13 +712,24 @@ def make_score_time_padding_chunks(
                 matched_perf_in_chunk = [p for p in midi_chunk if any(s in mxl_chunk for s in perf_to_score.get(p, []))]
                 matched_perf_ratio = len(matched_perf_in_chunk) / max(len(midi_chunk), 1)
 
-                perf_for_score = []
-                for s in mxl_chunk:
-                    ps = score_to_perf.get(s, [])
-                    if ps:
-                        perf_for_score.append(min(ps))
-                if len(perf_for_score) > 1:
-                    monotonic_ratio = float(np.mean(np.diff(np.asarray(perf_for_score)) >= 0))
+                raw_monotonic_ratio = _raw_monotonic_ratio(mxl_chunk, score_to_perf)
+                chord_aware_monotonic_ratio = raw_monotonic_ratio
+                if chord_aware_monotonic:
+                    (
+                        chord_aware_monotonic_ratio,
+                        chord_group_count,
+                        chord_note_count,
+                    ) = _chord_aware_monotonic_ratio(
+                        mxl_chunk,
+                        score_to_perf,
+                        score_onsets,
+                        chord_onset_eps,
+                    )
+                monotonic_ratio = (
+                    chord_aware_monotonic_ratio
+                    if chord_aware_monotonic
+                    else raw_monotonic_ratio
+                )
 
                 if matched_score_ratio < min_matched_score_ratio:
                     reason = "min_matched_score_ratio"
@@ -677,6 +762,16 @@ def make_score_time_padding_chunks(
             "matched_score_ratio": matched_score_ratio,
             "matched_perf_ratio": matched_perf_ratio,
             "monotonic_ratio": monotonic_ratio,
+            "raw_monotonic_ratio": raw_monotonic_ratio,
+            "chord_aware_monotonic_ratio": chord_aware_monotonic_ratio,
+            "chord_group_count": chord_group_count,
+            "chord_note_count": chord_note_count,
+            "monotonic_reclassified": bool(
+                is_trainable
+                and chord_aware_monotonic
+                and raw_monotonic_ratio < min_monotonic_ratio
+                and chord_aware_monotonic_ratio >= min_monotonic_ratio
+            ),
             "chunk_is_trainable": is_trainable,
             "reject_reason": reason,
             "pad_len": int(pad_len),
@@ -689,6 +784,10 @@ def make_score_time_padding_chunks(
             "swapped": False,
             "source": "pianocore_raw_alignment",
             "chunk_unit": "score_time_pseudo_beat_padding",
+            "chunk_monotonic_mode": (
+                "score_onset_group" if chord_aware_monotonic else "raw_note_order"
+            ),
+            "chord_onset_eps": float(chord_onset_eps),
             "beat_quarter_len": float(beat_quarter_len),
             "beats_per_chunk": int(beats_per_chunk),
             "stats": stats,
@@ -703,6 +802,10 @@ def make_score_time_padding_chunks(
         "swapped": False,
         "source": "pianocore_raw_alignment",
         "chunk_unit": "score_time_pseudo_beat_padding",
+        "chunk_monotonic_mode": (
+            "score_onset_group" if chord_aware_monotonic else "raw_note_order"
+        ),
+        "chord_onset_eps": float(chord_onset_eps),
         "beat_quarter_len": float(beat_quarter_len),
         "beats_per_chunk": int(beats_per_chunk),
         "stats": stats,
@@ -711,6 +814,9 @@ def make_score_time_padding_chunks(
         "rejection_counts": rejection_counts,
         "n_bad_chunks": int(sum(not x for x in chunk_is_trainable)),
         "n_good_chunks": int(sum(chunk_is_trainable)),
+        "n_chord_monotonic_rescued": int(
+            sum(bool(x.get("monotonic_reclassified")) for x in stats)
+        ),
     }
 
 
@@ -1134,6 +1240,8 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
                 max_midi_mxl_ratio=args.max_midi_mxl_ratio,
                 max_midi_notes_per_chunk=args.max_midi_notes_per_chunk,
                 min_monotonic_ratio=args.min_monotonic_ratio,
+                chord_aware_monotonic=args.chord_aware_monotonic,
+                chord_onset_eps=args.chord_onset_eps,
             )
         elif args.chunk_mode == "alignment_segment":
             if args.pseudo_beat_source == "xml_absolute_onset":
@@ -1189,6 +1297,9 @@ def handle_row(row_dict: Dict[str, Any], args) -> Dict[str, Any]:
             "n_chunks": len(chunks["midi"]),
             "n_alignment_segments": len(set(chunks.get("alignment_segment_id", []))),
             "chunk_mode": args.chunk_mode,
+            "chunk_monotonic_mode": chunks.get("chunk_monotonic_mode", "raw_note_order"),
+            "chord_onset_eps": chunks.get("chord_onset_eps", ""),
+            "n_chord_monotonic_rescued": chunks.get("n_chord_monotonic_rescued", 0),
         })
         return out
 
@@ -1290,6 +1401,20 @@ def main():
     ap.add_argument("--max-midi-notes-per-chunk", type=int, default=0)
     ap.add_argument("--min-monotonic-ratio", type=float, default=0.0)
     ap.add_argument(
+        "--chord-aware-monotonic",
+        action="store_true",
+        help=(
+            "For score_time_padding, ignore aligned performance-index permutations "
+            "inside XML notes sharing one absolute_onset."
+        ),
+    )
+    ap.add_argument(
+        "--chord-onset-eps",
+        type=float,
+        default=1e-6,
+        help="QuarterLength tolerance used to form one score-onset group.",
+    )
+    ap.add_argument(
         "--reuse-identity-cache",
         action="store_true",
         help="Trust previous strict identity results and skip score-MIDI vs parse_mxl rechecking for trusted rows.",
@@ -1317,6 +1442,9 @@ def main():
     ap.add_argument("--require-score-identity", action="store_true", default=True)
     ap.add_argument("--no-require-score-identity", dest="require_score_identity", action="store_false")
     args = ap.parse_args()
+
+    if args.chord_aware_monotonic and args.chunk_mode != "score_time_padding":
+        raise ValueError("--chord-aware-monotonic requires --chunk-mode score_time_padding")
 
     if args.min_mxl_notes <= 0:
         if args.chunk_mode == "note_count":
@@ -1372,6 +1500,11 @@ def main():
     ok_df = out_df[out_df["chunk_status"].eq("ok")]
     if len(ok_df):
         print("ok rows:", len(ok_df), "chunks:", int(ok_df["n_chunks"].sum()))
+        if "n_chord_monotonic_rescued" in ok_df.columns:
+            print(
+                "chord-aware monotonic rescued chunks:",
+                int(ok_df["n_chord_monotonic_rescued"].fillna(0).sum()),
+            )
 
 
 if __name__ == "__main__":
